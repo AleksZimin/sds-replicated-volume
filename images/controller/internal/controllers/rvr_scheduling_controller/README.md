@@ -45,7 +45,9 @@ if Scheduled replicas exist:
 
 if all non-Access replicas are scheduled → Done
 
-compute unscheduled = All - Scheduled - Deleting
+compute unscheduled = All - Scheduled
+    (deleting RVRs are not excluded: the scheduler places replicas, it does not
+    decide whether they are needed; unnecessary ones disappear on their own)
 
 Phase 2: for each unscheduled Diskful (in ID order):
     build per-RVR pipeline → filter → score via extender → SelectBest
@@ -230,7 +232,6 @@ The `schedulingContext` is built once per Reconcile invocation by `computeSchedu
 | `Access` | RVRs with type=Access | IDSet |
 | `Diskful` | RVRs with type=Diskful | IDSet |
 | `TieBreaker` | RVRs with type=TieBreaker | IDSet |
-| `Deleting` | RVRs with DeletionTimestamp | IDSet |
 | `Scheduled` | RVRs whose placement is complete for their type (`isReplicaScheduled`) | IDSet |
 
 ### Scheduled Detection
@@ -354,7 +355,7 @@ flowchart TD
     LoopRVR -->|Done| ComputeZones[computeReplicasByZone]
     ComputeZones --> Return([Return schedulingContext])
 
-    LoopRVR --> Classify["Add to All set<br/>Classify: Access / Diskful / TieBreaker<br/>Check DeletionTimestamp → Deleting"]
+    LoopRVR --> Classify["Add to All set<br/>Classify: Access / Diskful / TieBreaker"]
     Classify --> CheckNode{NodeName set?}
     CheckNode -->|No| LoopRVR
     CheckNode -->|Yes| MarkOccupied[Add to OccupiedNodes]
