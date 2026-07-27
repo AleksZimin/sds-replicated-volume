@@ -1,6 +1,6 @@
 ---
 name: writing-e2e-tests
-description: Write and maintain e2e integration tests in both suites — e2e/agent (plain Go + envtesting Setup/Discover helpers, documented in e2e/agent/TESTCASES.md) and e2e/full (Ginkgo specs built on the shared e2e/pkg/framework, documented in e2e/full/TEST_CASES*.md and e2e/full/RUNNING.md) — including framework helpers under e2e/pkg/framework and their unit tests, and keeping the test-case docs in sync with the Go test code. Use when editing anything under e2e/, when adding or changing a framework helper, and when planning or reviewing e2e coverage.
+description: Write and maintain e2e integration tests in both suites — e2e/agent (plain Go + envtesting Setup/Discover helpers, documented in e2e/agent/TESTCASES.md) and e2e/full (Ginkgo specs built on the shared e2e/pkg/framework, documented in e2e/full/TEST_CASES*.md and e2e/full/RUNNING.md) — including framework helpers under e2e/pkg/framework and their unit tests, the boundary between framework helpers and spec-local helpers in _test.go files, and keeping the test-case docs in sync with the Go test code (an entry title is the Ginkgo It text verbatim). Use when editing anything under e2e/, when adding or changing a framework helper, when deciding where a helper belongs, and when planning or reviewing e2e coverage.
 ---
 
 # Writing e2e tests
@@ -443,17 +443,35 @@ do not skip.
    `node_failure_quorum_test.go`, …).
  - Spec-local helpers shared by a few specs go into `<area>_helpers_test.go` in
    `package full`.
- - Anything that talks to the cluster, a node, or a device, and anything reusable
-   across areas, belongs in `e2e/pkg/framework` — not in a `_test.go` file.
+ - **The framework owns direct access.** A helper MUST live in
+   `e2e/pkg/framework` when it reaches the cluster, a node, or a device by
+   itself — a raw `f.Client` call (`Patch`, `Delete`, …), a hand-built exec, any
+   path that is not already wrapped by a framework primitive. Such a helper
+   follows the framework contract below: an unexported error-returning core plus
+   unit tests.
+ - **A `_test.go` file owns composition.** A thin composition of existing
+   framework primitives with Gomega assertions, a pure projection of an object's
+   state, and a Gomega matcher MAY stay in `<area>_helpers_test.go` — no matter
+   how many areas reuse it. Breadth of reuse is not a reason to move a helper
+   into the framework; direct access is.
 
 ## Test case documentation
 
 Human-readable cases live in `e2e/full/TEST_CASES*.md`, split by area
 (`TEST_CASES.md`, `TEST_CASES_LAYOUT.md`, `TEST_CASES_RSC_STATUS.md`,
 `TEST_CASES_RVA_STATUS.md`). Each entry describes setup, action and the
-observable assertions, and its title MUST match the Ginkgo spec text. Adding,
-renaming or removing a spec MUST update the matching document in the same
-change. Operational preconditions and runbook steps belong in
+observable assertions, and its title MUST match the Ginkgo spec text.
+
+The *Ginkgo spec text* is the text of the `It(...)` verbatim: no numbering
+prefix, no identifier suffix, no rewording — a title is greppable from the spec
+and back. Everything else that identifies the entry MUST live on the metadata
+line right below the title, never in the title itself: the `E2E-…` identifier,
+the position of the case in the document, and the text of the enclosing
+`Describe` container (one container usually spreads over several entries, so
+dropping it makes an entry unfindable).
+
+Adding, renaming or removing a spec MUST update the matching document in the
+same change. Operational preconditions and runbook steps belong in
 `e2e/full/RUNNING.md`.
 
 # Framework helpers (`e2e/pkg/framework`)
