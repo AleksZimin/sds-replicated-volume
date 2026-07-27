@@ -74,16 +74,17 @@ corresponding sections below):
 
 ### Signature
 
-The first argument of every test helper MUST be `e *envtesting.E`.
+The first argument of every test helper MUST be `e envtesting.E`. `envtesting.E`
+is an interface, so it MUST NOT be taken by pointer (`*envtesting.E`).
 
 ```go
 // SetupX Provides X, which is guaranteed to be ..., can be accessed via ...
-func SetupX(e *envtesting.E, <REQUIREMENTS>) <PROVIDED_X_SERVICE> {
+func SetupX(e envtesting.E, <REQUIREMENTS>) <PROVIDED_X_SERVICE> {
     // May call any test helpers (Setup, Discover).
 }
 
 // DiscoverX Discovers existing X, which is guaranteed to be ...
-func DiscoverX(e *envtesting.E, <REQUIREMENTS>) <PROVIDED_X_SERVICE> {
+func DiscoverX(e envtesting.E, <REQUIREMENTS>) <PROVIDED_X_SERVICE> {
     // May call other Discover helpers, but NOT Setup helpers.
 }
 ```
@@ -219,32 +220,32 @@ subtests, where subtests run sequentially and reuse state defined in the parent
 scope.
 
 ```go
-func TestMain(t *testing.T) {
-    e := envtesting.Discover(t)
+func TestReplicatedVolume(t *testing.T) {
+    e := envtesting.New(t)
     client := DiscoverClient(e)
 
     // Arrange: set up shared environment state.
     storageClass := SetupStorageClass(e, client)
     // e.Cleanup registered inside SetupStorageClass.
 
-    e.Run("WithSingleVolume", func(e *envtesting.E) {
+    e.Run("WithSingleVolume", func(e envtesting.E) {
         // Arrange: narrow state for this group of subtests.
         volume := SetupVolume(e, client, storageClass)
 
-        e.Run("VolumeIsAccessible", func(e *envtesting.E) {
+        e.Run("VolumeIsAccessible", func(e envtesting.E) {
             // Test case: uses volume from parent scope, no extra arrange.
         })
 
-        e.Run("VolumeCanBeResized", func(e *envtesting.E) {
+        e.Run("VolumeCanBeResized", func(e envtesting.E) {
             // Test case: uses volume from parent scope, acts and asserts.
         })
     })
 
-    e.Run("WithReplicatedVolume", func(e *envtesting.E) {
+    e.Run("WithReplicatedVolume", func(e envtesting.E) {
         // Arrange: different state, same storageClass from root scope.
         volume := SetupReplicatedVolume(e, client, storageClass)
 
-        e.Run("ReplicationIsHealthy", func(e *envtesting.E) {
+        e.Run("ReplicationIsHealthy", func(e envtesting.E) {
             // Test case: uses volume from parent scope.
         })
     })
