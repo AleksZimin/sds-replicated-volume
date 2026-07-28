@@ -124,6 +124,12 @@ var _ = Describe("Layout: r3->r2 migration by editing rsc.spec.replication",
 				for _, trv := range volumes {
 					trv.Await(ctx, match.RV.FormationComplete())
 					trv.Await(ctx, match.RV.Members(3))
+					// status.layout is published with the layout report, not during
+					// formation, so the string can only be read once the volume is
+					// converged.
+					trv.Await(ctx, tkmatch.ConditionReason(
+						v1alpha1.ReplicatedVolumeCondLayoutConvergedType,
+						v1alpha1.ReplicatedVolumeCondLayoutConvergedReasonConverged))
 					Expect(layoutOf(trv)).To(Equal(ptr.To("3D")))
 				}
 
