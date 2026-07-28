@@ -37,7 +37,7 @@ See `rfc-like-mdc.mdc` for normative keywords (BCP 14 / RFC 2119 / RFC 8174) and
   - registering **runnables**/**sources** on the **manager** (wiring-only), e.g. `mgr.Add(...)`, indexes, **sources**.
 
 - DENY (in **`controller.go`**):
-  - any functions that **compute/ensure/apply/reconcile** domain logic (must live in the `reconciler*.go` family).
+  - any functions that **compute/ensure/apply/reconcile** domain logic (must live in the **`reconciler*.go`** family).
   - implementing controller-runtime **predicates**/**filters**:
     - **`controller.go`** MUST NOT define `predicate.Funcs{...}` (or any other predicate implementation) inline.
     - All predicate implementations MUST live in **`predicates.go`** (see: `controller-predicate.mdc`).

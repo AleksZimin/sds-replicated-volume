@@ -25,7 +25,7 @@ This document complements `controller-reconcile-helper*.mdc` and defines rules t
   (typically executed by a `patch*` / `patch*Status` helper).
 - **Patch base (`base`)**: the `DeepCopy()` snapshot used as a diff reference for **one** patch request.
 
-## `reconciler*.go` layout and sorting (MUST)
+## **`reconciler*.go`** layout and sorting (MUST)
 
 This section defines the canonical ordering inside the **`reconciler*.go`** family (**`reconciler.go`** plus its `reconciler_<area>.go` area files; see `controller-terminology.mdc`) to keep the code readable and reviewable.
 It is a *layout* convention (not a behavioral contract), but it MUST be followed for consistency.

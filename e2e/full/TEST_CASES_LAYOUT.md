@@ -145,7 +145,7 @@ E2E-5 · case 5 · Describe: `Layout: r3->r2 migration by editing rsc.spec.repli
 
 Covers: decomposition T-2.0.3 ("mass migration" part); verifies blocks 1+2.
 
-Given: an r3 storage class with N volumes (N=3), I/O on a subset.
+Given: an r3 storage class with N volumes (N=3), one volume attached.
 
 When: `rsc.spec.replication` is edited to `Availability` once.
 

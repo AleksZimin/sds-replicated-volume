@@ -4,6 +4,8 @@ globs: api/v*/**/*_types.go,api/v*/**/common_types.go
 alwaysApply: false
 ---
 
+Normative keywords used in this document are defined in `rfc-like-mdc.mdc`.
+
 ## Code layout: type-centric blocks (MUST)
 
 - **Type-centric blocks** MUST be used to organize code:
