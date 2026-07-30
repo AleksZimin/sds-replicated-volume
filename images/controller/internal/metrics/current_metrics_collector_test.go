@@ -439,11 +439,22 @@ func TestCollectRVLayoutConvergedEmitsOneSeriesPerRV(t *testing.T) {
 					},
 				},
 			},
+			// The mirror case of rv-7: status True with a reason other than Converged (also never
+			// written by the controller) must not be reported as converged either. Both directions
+			// are needed to pin the convention "value 1 iff status True AND reason Converged".
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "rv-8-true-not-converged"},
+				Status: v1alpha1.ReplicatedVolumeStatus{
+					Conditions: []metav1.Condition{
+						layoutCond(metav1.ConditionTrue, v1alpha1.ReplicatedVolumeCondMembershipLayoutConvergedReasonConverging),
+					},
+				},
+			},
 		})
 	}()
 
 	metrics := collectTestMetrics(t, ch)
-	if len(metrics) != 7 {
+	if len(metrics) != 8 {
 		t.Fatalf("expected one series per RV, got %d: %#v", len(metrics), metrics)
 	}
 	// Series are emitted sorted by RV name.
@@ -474,6 +485,10 @@ func TestCollectRVLayoutConvergedEmitsOneSeriesPerRV(t *testing.T) {
 	assertMetric(t, metrics[6], 0, map[string]string{
 		LabelName:   "rv-7-converged-not-true",
 		LabelReason: v1alpha1.ReplicatedVolumeCondMembershipLayoutConvergedReasonConverged,
+	})
+	assertMetric(t, metrics[7], 0, map[string]string{
+		LabelName:   "rv-8-true-not-converged",
+		LabelReason: v1alpha1.ReplicatedVolumeCondMembershipLayoutConvergedReasonConverging,
 	})
 }
 
