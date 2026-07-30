@@ -596,12 +596,18 @@ of them:
    and names `E2E_ALLOW_DISRUPTIVE` / `E2E_RUN_ALL`, which the labelled spec then
    needs in order to run at all.
 
-Guarded today: `f.RebootNode`, `trvr.RemoveFinalizers`, and `startVolumeIO`
-(`e2e/full/io_helpers_test.go`, the wrapper every spec uses to reach
-`f.StartIOWorkload`). Not yet guarded, and therefore still relying on the author
-to write the label: `f.SetNodeLabel` and `f.StartIOWorkload` itself. Adding a
-destructive helper — or reaching one of those two directly — means adding the
-guard call in the same change.
+Guarded today: `f.RebootNode`, `f.StartIOWorkload`, `f.SetNodeLabel` and
+`trvr.RemoveFinalizers` — every framework helper that damages state shared with
+the rest of the suite, so no spec can reach one of them unlabelled, whether it
+calls it directly or through a wrapper. Adding a destructive helper means adding
+the guard call in the same change.
+
+A wrapper around a guarded helper does **not** repeat the guard: `startVolumeIO`
+(`e2e/full/io_helpers_test.go`) only reads before it calls `f.StartIOWorkload`,
+so the guard inside that helper already stops the same spec — and one requirement
+checked in two places is two messages free to drift apart. A wrapper adds a guard
+of its own only when it does destructive work *before* reaching the guarded
+helper, and then names that work, not the helper's.
 
 ## Destructive node operations
 
@@ -639,11 +645,13 @@ Starts a persistent raw-device writer on a node and provides an
 Use it whenever a spec claims that "I/O keeps flowing"; asserting conditions
 alone proves nothing about the data path.
 
+ - The calling spec MUST carry `fw.LabelDisruptive`; `StartIOWorkload` enforces
+   it before the options are even validated (§Destructive operations are guarded
+   at the call site).
  - Specs in `e2e/full` reach it through `startVolumeIO`
    (`io_helpers_test.go`), which resolves the device and the expected identity
-   from the RVA and the node's DRBD resource, and enforces `fw.LabelDisruptive`
-   at the call site (§Destructive operations are guarded at the call site). Use
-   that wrapper rather than calling `f.StartIOWorkload` directly.
+   from the RVA and the node's DRBD resource. Use that wrapper rather than
+   calling `f.StartIOWorkload` directly.
  - The device is `RVA.Status.DevicePath` and nothing else; the workload runs in
    the node's host namespaces through the same sds-node-configurator + nsenter
    channel as the other node helpers.

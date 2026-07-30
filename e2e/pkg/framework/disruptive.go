@@ -75,8 +75,10 @@ func enforceDisruptive() {
 // is executing right now carries LabelDisruptive, on itself or on an enclosing
 // container. A guarded helper calls it as its FIRST statement, so the requirement
 // its doc comment states is checked where the damage would be done. Guarded
-// today: Framework.RebootNode, TestRVR.RemoveFinalizers, and startVolumeIO in
-// e2e/full.
+// today: Framework.RebootNode, Framework.StartIOWorkload, Framework.SetNodeLabel
+// and TestRVR.RemoveFinalizers — every framework helper that damages state shared
+// with the rest of the suite. A wrapper around a guarded helper adds no guard of
+// its own: two checks of one requirement can only drift apart in wording.
 //
 // It complements the class gate (enforceDisruptive) and cannot be replaced by it.
 // The gate runs in JustBeforeEach and sees only the labels the spec's author

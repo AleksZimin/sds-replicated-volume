@@ -18,6 +18,7 @@ package framework
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -52,6 +53,10 @@ var _ = Describe("hasDisruptiveLabel", func() {
 // the guard. Every message assertion pins it, because a message that does not
 // name the refused operation cannot be acted on.
 const disruptiveOp = "rebooting node worker-2"
+
+// testSecondNode is a node name that sorts after testNode, so a request that
+// labels two nodes has one rendering to assert on regardless of map order.
+const testSecondNode = "worker-2"
 
 // suiteLevelNodeTypes is the set the guard answers with "move the call into a
 // spec". It mirrors types.NodeTypesForSuiteLevelNodes member by member, so a
@@ -136,6 +141,26 @@ var _ = Describe("RequireDisruptiveSpec", Label(LabelDisruptive), func() {
 
 		RequireDisruptiveSpec(disruptiveOp)
 	})
+
+	// The guarded helper end to end, not the guard on its own: with the label in
+	// scope the call must reach the writer rather than being refused. The fake node
+	// stands in for the host, so guard, validation, cleanup registration and start
+	// all run without a cluster.
+	It("lets a labelled spec through Framework.StartIOWorkload", func(ctx SpecContext) {
+		node := newFakeIONode()
+		node.onSpawn = (*fakeIONode).startWriter
+		f := &Framework{nodeRun: &stubRunner{respond: node.respond}}
+
+		w := f.StartIOWorkload(ctx, IOWorkloadOptions{
+			NodeName:         testNode,
+			DevicePath:       testDevicePath,
+			DRBDResourceName: testDRBDName,
+			RunID:            testRunID,
+		})
+
+		Expect(w.RunID()).To(Equal(testRunID))
+		Expect(node.writerStarts).To(Equal(1), "the writer must have been spawned, not merely admitted")
+	})
 })
 
 // TestDisruptiveGuardOutsideOfASpec covers the one branch that is unreachable
@@ -148,14 +173,13 @@ var _ = Describe("RequireDisruptiveSpec", Label(LabelDisruptive), func() {
 // The same branch pins the guard INTO each destructive framework helper: the
 // panic names the operation the helper passed in, which can only happen if the
 // helper really calls the guard, and does so before touching the cluster — the
-// fixtures below carry nil clients, so a helper that skipped the guard would
-// panic with a nil-pointer runtime error instead of a message.
+// fixtures below carry a zero Framework, so a helper that skipped the guard would
+// panic on its nil client or nil naming state, with a runtime error instead of a
+// message.
 //
-// Two callers are not covered here. startVolumeIO lives in e2e/full, a package
-// whose tests need a cluster, so a unit pin could not be run there. The guard
-// inside RequireDisruptiveSpec's other two branches calls Fail, which cannot be
-// observed from a spec without failing it — classifyDisruptiveCallSite is the
-// unit-testable decision, and it is covered above.
+// The other two branches are not pinned per helper: they call Fail, which cannot
+// be observed from a spec without failing it — classifyDisruptiveCallSite is the
+// unit-testable decision behind them, and it is covered above.
 func TestDisruptiveGuardOutsideOfASpec(t *testing.T) {
 	if leafNodeType := CurrentSpecReport().LeafNodeType; leafNodeType != types.NodeTypeInvalid {
 		t.Fatalf("precondition: expected no Ginkgo node to be running, got %s", leafNodeType)
@@ -182,6 +206,32 @@ func TestDisruptiveGuardOutsideOfASpec(t *testing.T) {
 			caller:    "TestRVR.RemoveFinalizers",
 			operation: "removing the finalizers of " + trvr.Name(),
 			call:      func() { trvr.RemoveFinalizers(context.Background()) },
+		},
+		{
+			// No RunID, exactly as specs call it: the default one is handed out
+			// from naming state that only a real Setup() populates, so a helper
+			// that skipped the guard would panic on that nil state.
+			caller: "Framework.StartIOWorkload",
+			operation: fmt.Sprintf("writing to the raw block device %q on node %q",
+				testDevicePath, testNode),
+			call: func() {
+				(&Framework{}).StartIOWorkload(context.Background(), IOWorkloadOptions{
+					NodeName:         testNode,
+					DevicePath:       testDevicePath,
+					DRBDResourceName: testDRBDName,
+				})
+			},
+		},
+		{
+			caller: "Framework.SetNodeLabel",
+			operation: fmt.Sprintf("setting the node label %q on nodes [%s %s]",
+				ZoneLabelKey, testNode, testSecondNode),
+			call: func() {
+				(&Framework{}).SetNodeLabel(context.Background(), ZoneLabelKey,
+					// Deliberately not in sorted order: the message must name the
+					// nodes deterministically, whatever order the map is built in.
+					map[string]string{testSecondNode: "zone-b", testNode: "zone-a"})
+			},
 		},
 	} {
 		t.Run(tc.caller, func(t *testing.T) {
