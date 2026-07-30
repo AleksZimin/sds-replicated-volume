@@ -373,9 +373,14 @@ Rules:
 ## Timeouts
 
 The timeout policy is enforced by a Ginkgo transformer (`timeout_policy.go`):
-the default `SpecTimeout` is 30s, an explicit `SpecTimeout` above 30s requires
-`Label(fw.LabelSlow)` (the transformer fails the tree otherwise), and every
-budget is scaled by `E2E_TIMEOUT_MULTIPLIER`. Do not hand-roll deadlines with
+the default `SpecTimeout` is 30s, `Label(fw.LabelSlow)` raises that default to
+1min and `Label(fw.LabelLongHaul)` raises it to 30min (LongHaul dominates when
+both are present), and an explicit `SpecTimeout` above 30s requires one of
+those two labels — with neither, the transformer fails the tree with
+`add Label("Slow") or Label("LongHaul"), or reduce the timeout`. The label may
+sit on an enclosing `Describe`: the transformer reads the labels in scope for
+the spec, own and inherited alike. Every budget is scaled by
+`E2E_TIMEOUT_MULTIPLIER`. Do not hand-roll deadlines with
 `time.After`; use `SpecTimeout` plus the framework's `Await`/`Eventually`
 helpers so the multiplier applies.
 
@@ -401,7 +406,9 @@ constants, never string literals:
    would overlap nothing. The spec is skipped unless `E2E_ALLOW_LONG_HAUL=true`
    or `E2E_RUN_ALL=true`; a focused run (`--focus`/`--focus-file`) bypasses this
    gate, and only this one — focusing says "run this spec", not "you may damage
-   this cluster". A spec carrying both labels keeps the `Disruptive` placement.
+   this cluster". A spec carrying both labels keeps the `Disruptive` placement,
+   whether `Disruptive` is written on the spec itself or inherited from a parent
+   container.
  - `fw.LabelFeature*` — one per functional area, for `--label-filter`.
 
 `Disruptive` and `LongHaul` are the opt-in classes. Their gates share one
