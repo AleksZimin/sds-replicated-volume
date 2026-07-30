@@ -396,7 +396,9 @@ constants, never string literals:
    `topology.kubernetes.io/zone`), removing a finalizer by hand, or writing to a
    raw block device. The label auto-injects `Serial` and the lowest spec
    priority, and the spec is skipped unless `E2E_ALLOW_DISRUPTIVE=true` or
-   `E2E_RUN_ALL=true`.
+   `E2E_RUN_ALL=true`. For the destructive helpers the requirement is
+   **executable**, not just documented: they refuse to run in an unlabelled spec
+   (see §Destructive operations are guarded at the call site).
  - `fw.LabelLongHaul` — for specs that are long because they *wait* for the
    cluster (an alert with `for: 15m` cannot be observed sooner). The label
    raises the default `SpecTimeout` to 30min and auto-injects the **highest**
@@ -438,8 +440,8 @@ selectors used by the whole suite) MUST also be `Serial` — which
    before writing.
  - Never strip a finalizer during a healthy run. The only exception is a spec
    whose subject *is* the documented manual-escape recipe; such a spec carries
-   `fw.LabelDisruptive` and the exception is written down in
-   `e2e/full/RUNNING.md`.
+   `fw.LabelDisruptive` — `trvr.RemoveFinalizers` refuses to run without it — and
+   the exception is written down in `e2e/full/RUNNING.md`.
  - Resource names come from the framework (`f.Name`, `f.UniqueName`, builder
    auto-naming) so leftovers are detectable on the next run. Random or
    timestamped names are forbidden.
@@ -543,6 +545,12 @@ same change. Operational preconditions and runbook steps belong in
    re-executes on a transport error against a cached pod.
  - Document guarantees the Go types cannot express: idempotency, what is
    asserted, what is left behind, and which cleanup is auto-registered.
+ - **A helper that damages state shared with the rest of the suite MUST call
+   `fw.RequireDisruptiveSpec("<operation>")` as its first statement** — see
+   §Destructive operations are guarded at the call site. A doc comment that only
+   *states* the `fw.LabelDisruptive` requirement is not enough: the class gate
+   cannot see the call, so the requirement is unenforced until the helper checks
+   it.
 
 ## Unit tests
 
@@ -553,6 +561,47 @@ without a cluster, driven by the stub runner. These tests are executed by
 parsers (including malformed/truncated input), each outcome of a classification
 table, and — for any command that must not run twice — an assertion on the
 number of recorded exec calls.
+
+## Destructive operations are guarded at the call site
+
+The class gate (`enforceDisruptive`) runs in `JustBeforeEach` and can only read
+the labels the spec's author declared. It cannot know whether the spec is about
+to call a destructive helper, so a spec that forgets `fw.LabelDisruptive` passes
+the gate and then damages a shared stand anyway. The call site is the only place
+where "this operation is destructive" and "these are the labels in scope" are
+both known, so the check lives there:
+
+```go
+fw.RequireDisruptiveSpec("rebooting node " + nodeName)
+```
+
+`fw.RequireDisruptiveSpec` (`e2e/pkg/framework/disruptive.go`) stops the run
+unless the executing spec carries `fw.LabelDisruptive`, on itself or on an
+enclosing container, and its argument names the refused operation in the message.
+It distinguishes three call sites, because a bare label check would misreport two
+of them:
+
+ - **No Ginkgo node running** — tree construction (a `Describe`/`Context` body, a
+   package-level variable) or a plain go test. `CurrentSpecReport()` answers with
+   a zero-value report whose label list is *empty*, so "the label is missing"
+   would name the wrong cause. This is a programming error in the caller, so the
+   guard **panics** with its own message instead of calling `Fail` — outside a
+   node `Fail` has no spec to attribute the failure to and unwinds with Ginkgo's
+   generic `UncaughtGinkgoPanic` text.
+ - **A suite-level node** (`BeforeSuite`/`AfterSuite`/`SynchronizedBeforeSuite`/
+   `SynchronizedAfterSuite`/`ReportBeforeSuite`/`ReportAfterSuite`/ a suite-level
+   `DeferCleanup`). Such a node takes no decorators, so demanding a label would
+   be unactionable: it fails asking for the call to be moved into a spec.
+ - **A spec without the label** — it fails asking for `Label(fw.LabelDisruptive)`
+   and names `E2E_ALLOW_DISRUPTIVE` / `E2E_RUN_ALL`, which the labelled spec then
+   needs in order to run at all.
+
+Guarded today: `f.RebootNode`, `trvr.RemoveFinalizers`, and `startVolumeIO`
+(`e2e/full/io_helpers_test.go`, the wrapper every spec uses to reach
+`f.StartIOWorkload`). Not yet guarded, and therefore still relying on the author
+to write the label: `f.SetNodeLabel` and `f.StartIOWorkload` itself. Adding a
+destructive helper — or reaching one of those two directly — means adding the
+guard call in the same change.
 
 ## Destructive node operations
 
@@ -566,6 +615,9 @@ spec can observe the outage itself: `RebootNode` returns as soon as the reboot
 is proven to have started, and `reboot.AwaitCompleted(ctx)` blocks until the
 node is back. A spec that only needs the node back calls both in sequence.
 
+ - The calling spec MUST carry `fw.LabelDisruptive`; `RebootNode` enforces it
+   before anything is executed on the host (§Destructive operations are guarded
+   at the call site).
  - The reboot command is executed through a **no-retry** exec: `execOnNode`
    retries a transport error against a freshly resolved pod, which for
    `systemctl reboot` risks a second reboot.
@@ -587,6 +639,11 @@ Starts a persistent raw-device writer on a node and provides an
 Use it whenever a spec claims that "I/O keeps flowing"; asserting conditions
 alone proves nothing about the data path.
 
+ - Specs in `e2e/full` reach it through `startVolumeIO`
+   (`io_helpers_test.go`), which resolves the device and the expected identity
+   from the RVA and the node's DRBD resource, and enforces `fw.LabelDisruptive`
+   at the call site (§Destructive operations are guarded at the call site). Use
+   that wrapper rather than calling `f.StartIOWorkload` directly.
  - The device is `RVA.Status.DevicePath` and nothing else; the workload runs in
    the node's host namespaces through the same sds-node-configurator + nsenter
    channel as the other node helpers.

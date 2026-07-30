@@ -47,7 +47,10 @@ func devicePathPublished() types.GomegaMatcher {
 // The device comes from RVA.status.devicePath and the expected identity from
 // the DRBD resource of the replica living on that same node, so the writer
 // refuses to touch anything but this volume's device. The caller MUST hold
-// fw.LabelDisruptive: the writer writes to a raw block device on the host.
+// fw.LabelDisruptive, on the spec or on an enclosing container: the writer
+// writes to a raw block device on the host. The requirement is enforced, not
+// merely stated — fw.RequireDisruptiveSpec fails the spec before the writer is
+// started.
 //
 // tune adjusts the options before the writer starts — a spec that disrupts the
 // cluster raises MaxHeartbeatGap so a brief blip is not read as a stall.
@@ -58,6 +61,7 @@ func startVolumeIO(
 	tune ...func(*fw.IOWorkloadOptions),
 ) *fw.IOWorkload {
 	GinkgoHelper()
+	fw.RequireDisruptiveSpec("writing to the raw device published by attachment " + trva.Name())
 
 	trva.Await(ctx, devicePathPublished())
 	rva := trva.Object()
