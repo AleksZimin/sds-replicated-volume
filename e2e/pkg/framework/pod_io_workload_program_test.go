@@ -116,18 +116,46 @@ var _ = Describe("PodIOWorkload pod commands", func() {
 			"a shell whose sync takes no file argument must still work")
 	})
 
+	It("never answers a failed per-file flush with the global sync", func() {
+		// The global sync is the fallback for a shell whose sync takes no file
+		// argument, chosen once at startup. Reaching for it when a per-file flush
+		// FAILED would swallow the failure instead: sync(2) reports an error to
+		// nobody, ever, and the read-back that follows is served from the page
+		// cache, so every beat after an EIO on flush would still be green.
+		Expect(podIOWorkloadProgram).To(ContainSubstring(strings.Join([]string{
+			`sync_file() {`,
+			`    if [ "$sync_mode" = file ]; then`,
+			`        sync -d "$1"`,
+			`    else`,
+			`        sync`,
+			`    fi`,
+			`}`,
+		}, "\n")))
+	})
+
 	It("publishes a beat only after the write was fsynced, read back and compared", func() {
 		write := strings.Index(podIOWorkloadProgram, `printf '%s\n' "$payload" >"$beat"`)
-		sync := strings.Index(podIOWorkloadProgram, `sync_file "$beat"`)
+		sync := strings.Index(podIOWorkloadProgram, `sync_file "$beat" || die "io: flushing the beat file`)
 		readBack := strings.Index(podIOWorkloadProgram, `back=$(cat "$beat")`)
 		compare := strings.Index(podIOWorkloadProgram, `if [ "$back" != "$payload" ]`)
-		beat := strings.Index(podIOWorkloadProgram, `journal_line "ok $seq 0 $ts $c"`)
+		beat := strings.Index(podIOWorkloadProgram, `journal_line "ok $seq 0 $(now_ms) $c"`)
 
 		Expect(write).To(BeNumerically(">", 0))
-		Expect(sync).To(BeNumerically(">", write))
+		Expect(sync).To(BeNumerically(">", write), "an unchecked flush is a beat that proves nothing")
 		Expect(readBack).To(BeNumerically(">", sync))
 		Expect(compare).To(BeNumerically(">", readBack))
 		Expect(beat).To(BeNumerically(">", compare))
+	})
+
+	It("timestamps a beat after the verified cycle, exactly as the node-level writer does", func() {
+		// A beat stamped BEFORE the write dates a freeze back to the moment the
+		// frozen iteration began, so a freeze that ended while the stop flag was
+		// already up sits inside no inter-beat gap at all — and the writer reports
+		// itself healthy for the one outage the workload exists to catch.
+		Expect(podIOWorkloadProgram).To(ContainSubstring(`journal_line "ok $seq 0 $(now_ms) $c"`))
+		Expect(podIOWorkloadProgram).NotTo(ContainSubstring(`journal_line "ok $seq 0 $ts $c"`))
+		Expect(ioWorkloadProgram).To(ContainSubstring(`journal("ok %d %d %d %08x" % (seq, slot, now_ms(), crc))`),
+			"the journal format is shared, so both writers must stamp a beat at the same point")
 	})
 
 	It("writes the data file once and hashes it before recording the digest", func() {
@@ -308,6 +336,209 @@ var _ = Describe("PodIOWorkload writer program, executed", Ordered, func() {
 
 		Expect(err).To(HaveOccurred())
 		Expect(string(out)).To(ContainSubstring("pod-io-workload: cannot create"))
+	})
+})
+
+// A volume that freezes and a volume that answers a flush with EIO are the two
+// failures this writer exists to catch, and a healthy temporary directory
+// produces neither. The specs below put a STUB sync(1) on the writer's PATH and
+// drive it: the stub IS the volume, so a freeze is a flush that blocks and a lost
+// write is a flush that returns an error. Both make the writer's behaviour
+// observable in the only place a cluster run can read it — its journal.
+var _ = Describe("PodIOWorkload writer program, against a volume that stops flushing", func() {
+	const (
+		// The writer's clock has one-second resolution (`date +%s`), so a freeze
+		// has to last several seconds to be measurable at all, and freezeGapFloor
+		// leaves one second of truncation at each end of the window. A freeze
+		// stamped the old way — before the frozen cycle rather than after it —
+		// measures one beat interval, which is why the floor is well above it.
+		freezeHold     = 5 * time.Second
+		freezeGapFloor = 3 * time.Second
+
+		// Three beat intervals are enough to catch a writer that kept beating.
+		idleWatch = 3 * time.Second
+
+		wait = 15 * time.Second
+		poll = 100 * time.Millisecond
+	)
+
+	var dir, journal, beat, stop string
+	// flag is what the spec raises to make the stubbed volume misbehave, and
+	// flag+".frozen" is how the stub reports back that a flush is blocked in it.
+	var flag, stubDir, logPath string
+
+	BeforeEach(func() {
+		for _, bin := range []string{"sh", "sha256sum", "date", "sed", "grep", "cut", "tail", "wc", "sleep"} {
+			if _, err := exec.LookPath(bin); err != nil {
+				Skip("the writer program cannot be executed here: " + bin + " is missing")
+			}
+		}
+		// A shell that carries sync(1) as a BUILT-IN never consults PATH, so the
+		// stub would never be reached and these specs would time out instead of
+		// testing anything. Run them on a shell whose sync is a real binary.
+		out, err := exec.Command("sh", "-c", "command -v sync").Output()
+		if err != nil || !strings.HasPrefix(strings.TrimSpace(string(out)), "/") {
+			Skip("the shell here does not resolve sync(1) through PATH, so the volume cannot be stubbed")
+		}
+
+		root := GinkgoT().TempDir()
+		dir = filepath.Join(root, "io")
+		journal = filepath.Join(dir, "journal")
+		beat = filepath.Join(dir, "beat")
+		stop = filepath.Join(dir, "stop")
+		flag = filepath.Join(root, "flag")
+		stubDir = filepath.Join(root, "bin")
+		logPath = filepath.Join(root, "writer.log")
+		Expect(os.MkdirAll(stubDir, 0o700)).To(Succeed())
+	})
+
+	// start installs stub as the sync(1) the writer will find and launches the
+	// writer with it on PATH. Unlike runWriter above, the writer is LEFT RUNNING
+	// and killed by a cleanup: these specs have to reach into the volume while a
+	// flush of it is still in flight.
+	//
+	// The kill goes to the whole process group, because the writer's `sleep` — and
+	// the stub blocking inside its own — are children holding the same
+	// descriptors.
+	start := func(stub string) {
+		GinkgoHelper()
+		Expect(os.WriteFile(filepath.Join(stubDir, "sync"), []byte(stub), 0o700)).To(Succeed())
+
+		script := strings.Join([]string{
+			"dir=" + dir, "interval=1", "records=4",
+			"record='" + podIODataRecord + "'", "", podIOWorkloadProgram,
+		}, "\n")
+		path := filepath.Join(filepath.Dir(dir), "writer.sh")
+		Expect(os.WriteFile(path, []byte(script), 0o600)).To(Succeed())
+		log, err := os.Create(logPath)
+		Expect(err).NotTo(HaveOccurred())
+
+		cmd := exec.Command("sh", path)
+		// The last PATH wins: os/exec keeps only the last value of a duplicated
+		// environment key.
+		cmd.Env = append(os.Environ(), "PATH="+stubDir+":"+os.Getenv("PATH"))
+		cmd.Stdout, cmd.Stderr = log, log
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		Expect(cmd.Start()).To(Succeed())
+		DeferCleanup(func() {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			_ = log.Close()
+		})
+	}
+
+	// journalNow reads the journal the way the framework's probe does. Reading it
+	// while the writer appends is safe: parseIOJournal tolerates a partial LAST
+	// record, which is exactly what a read that raced an append sees.
+	journalNow := func(g Gomega) ioJournal {
+		text, err := os.ReadFile(journal)
+		g.Expect(err).NotTo(HaveOccurred())
+		j, err := parseIOJournal(string(text))
+		g.Expect(err).NotTo(HaveOccurred())
+		return j
+	}
+
+	// because carries the whole diagnosis a failure here has — a shell writer
+	// leaves nothing else behind. It is handed to Gomega as a func() string, which
+	// Gomega calls lazily: a description built eagerly would report the journal as
+	// it was when the assertion STARTED, which for a timed-out Eventually is the
+	// one state that explains nothing.
+	because := func(why string) func() string {
+		return func() string {
+			text, _ := os.ReadFile(journal)
+			log, _ := os.ReadFile(logPath)
+			return fmt.Sprintf("%s\njournal:\n%swriter output:\n%s", why, text, log)
+		}
+	}
+
+	It("leaves a freeze that ended after the stop flag went up inside an inter-beat gap", func() {
+		// The stub blocks the flush of the BEAT file only. That is where a frozen
+		// volume stalls the writer, and blocking there rather than in the journal's
+		// own flush is what makes the frozen cycle the one whose beat is published
+		// after the freeze — the case a beat stamped before its cycle loses.
+		start(strings.Join([]string{
+			`#!/bin/sh`,
+			`if [ "$2" = "` + beat + `" ] && [ -f "` + flag + `" ]; then`,
+			`    : >"` + flag + `.frozen"`,
+			`    while [ -f "` + flag + `" ]; do sleep 1; done`,
+			`fi`,
+			`exit 0`,
+		}, "\n"))
+
+		By("letting the writer beat, then freezing the flush of its next beat")
+		Eventually(func(g Gomega) int { return len(journalNow(g).Beats) }).
+			WithTimeout(wait).WithPolling(poll).Should(BeNumerically(">=", 2))
+		Expect(os.WriteFile(flag, nil, 0o600)).To(Succeed())
+		Eventually(func() bool {
+			_, err := os.Stat(flag + ".frozen")
+			return err == nil
+		}).WithTimeout(wait).WithPolling(poll).Should(BeTrue(),
+			because("the stub was never asked to flush the beat file"))
+
+		By("raising the stop flag while the volume is still frozen, and holding the freeze")
+		Expect(os.WriteFile(stop, nil, 0o600)).To(Succeed())
+		time.Sleep(freezeHold) // there is nothing to poll for: the freeze IS the wait
+		Expect(os.Remove(flag)).To(Succeed())
+
+		By("waiting for the beat the freeze delayed, and for the writer to stop")
+		var j ioJournal
+		Eventually(func(g Gomega) *ioTermination {
+			j = journalNow(g)
+			return j.Termination
+		}).WithTimeout(wait).WithPolling(poll).ShouldNot(BeNil(),
+			because("the writer never published the delayed beat and stopped"))
+
+		gap, endedBy := j.maxInterBeatGap()
+
+		Expect(j.Termination.Failed).To(BeFalse(),
+			"the freeze ended before the stop was served, so the writer must stop cleanly: %s", j.Termination.Message)
+		Expect(gap).To(BeNumerically(">=", freezeGapFloor),
+			because("a freeze that ended inside the stop window is reported by nobody unless it lands in this gap"))
+		Expect(endedBy).NotTo(BeNil())
+		Expect(endedBy.Sequence).To(Equal(j.Beats[len(j.Beats)-1].Sequence),
+			"the freeze must show as the gap the LAST beat ended, not as an earlier one")
+	})
+
+	It("dies on a beat whose flush returned EIO instead of beating on", func() {
+		// The stub succeeds until the flag is raised, so the writer still picks the
+		// per-file flush at startup, and then answers the flush of the beat file the
+		// way a volume that dropped the write does. NOTHING else fails: the
+		// read-back is served from the page cache and the journal's own flush still
+		// works, which is precisely why an unchecked — or globally retried — flush
+		// would keep every beat after the EIO green.
+		start(strings.Join([]string{
+			`#!/bin/sh`,
+			`if [ "$2" = "` + beat + `" ] && [ -f "` + flag + `" ]; then`,
+			`    echo "sync: error syncing '` + beat + `': Input/output error" >&2`,
+			`    exit 5`,
+			`fi`,
+			`exit 0`,
+		}, "\n"))
+
+		By("letting the writer beat, then making the volume drop the write")
+		Eventually(func(g Gomega) int { return len(journalNow(g).Beats) }).
+			WithTimeout(wait).WithPolling(poll).Should(BeNumerically(">=", 2))
+		Expect(os.WriteFile(flag, nil, 0o600)).To(Succeed())
+
+		By("expecting the failure in the journal instead of another beat")
+		var j ioJournal
+		Eventually(func(g Gomega) *ioTermination {
+			j = journalNow(g)
+			return j.Termination
+		}).WithTimeout(wait).WithPolling(poll).ShouldNot(BeNil(),
+			because("a flush that returned EIO left the journal green instead of killing the writer"))
+
+		Expect(j.Termination.Failed).To(BeTrue())
+		Expect(j.Termination.Message).To(ContainSubstring("flushing the beat file to the volume failed"))
+
+		// The fail record must stay the LAST record: a beat journalled after it is a
+		// green beat over a write the volume told the writer it had dropped.
+		Consistently(func(g Gomega) string {
+			text, err := os.ReadFile(journal)
+			g.Expect(err).NotTo(HaveOccurred())
+			lines := strings.Split(strings.TrimRight(string(text), "\n"), "\n")
+			return lines[len(lines)-1]
+		}).WithTimeout(idleWatch).WithPolling(poll).Should(HavePrefix("fail "))
 	})
 })
 

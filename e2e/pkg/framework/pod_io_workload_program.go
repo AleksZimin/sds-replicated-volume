@@ -71,11 +71,22 @@ const (
 //     can force. What makes a frozen volume visible is the fsync: it blocks
 //     while the device does not complete writes, and every blocked second shows
 //     up as an inter-beat gap;
+//   - timestamp a beat when it is PUBLISHED, after the verified cycle, exactly
+//     as the node-level writer does. A beat stamped before the write would date
+//     a freeze back to the moment the frozen iteration began, and a freeze that
+//     ended inside the cleanup's stop window would then leave no gap between any
+//     two beats at all — the writer would report itself healthy for the one
+//     outage the workload exists to catch;
+//   - treat a failing fsync as a failure of the data path and die: a flush that
+//     returns EIO is how a volume reports that it dropped the write, and the
+//     read-back that follows is served from the page cache, so a swallowed
+//     fsync error turns into a green beat over lost data;
 //   - prefer a per-file fsync (`sync -d FILE`) over the global sync(2): a global
 //     sync flushes every filesystem on the NODE, so one frozen volume would
 //     stall the beats of every other workload on that node and the freeze would
 //     be reported against volumes that are perfectly healthy. The global sync is
-//     only the fallback for a shell whose sync takes no file argument;
+//     only the fallback for a shell whose sync takes no file argument, chosen
+//     ONCE at startup — never a fallback for a flush that failed;
 //   - never exit once the journal exists: the journal and the data file are read
 //     by exec'ing into THIS container, so a container that exits (or crash-loops)
 //     takes the only way to read its own evidence with it. A failure is
@@ -95,18 +106,29 @@ now_ms() { echo "$(date +%s)000"; }
 # idle keeps the container alive so its journal and data file stay readable.
 idle() { while true; do sleep 3600; done; }
 
+# sync_file flushes ONE file and REPORTS whether that flush succeeded: its exit
+# status is the only evidence the volume accepted the bytes, so every caller
+# checks it. In file mode a failing 'sync -d' is a failure of the data path — EIO
+# from the flush is how a volume that lost its quorum answers — and falling back
+# to the global sync here would swallow it: sync(2) reports an error to nobody,
+# ever, while the read-back that follows is served from the page cache. The
+# fallback for a shell whose sync takes no file argument is chosen once, at
+# startup, and lives nowhere else.
 sync_file() {
-    if [ "$sync_mode" = file ] && sync -d "$1" 2>/dev/null; then
-        return 0
+    if [ "$sync_mode" = file ]; then
+        sync -d "$1"
+    else
+        sync
     fi
-    sync
 }
 
 journal_line() {
-    printf '%s\n' "$1" >>"$journal"
+    printf '%s\n' "$1" >>"$journal" || return 1
     sync_file "$journal"
 }
 
+# die reports through the journal best-effort: what failed may be the flush of
+# this very record, and then there is nothing left to report it with.
 die() {
     journal_line "fail $(now_ms) $1"
     printf 'pod-io-workload: %s\n' "$1" >&2
@@ -127,13 +149,13 @@ if [ ! -f "$sum" ]; then
         printf "$record" "$i"
         i=$((i + 1))
     done >"$data.tmp" || die "data: writing the data file failed"
-    sync_file "$data.tmp"
+    sync_file "$data.tmp" || die "data: flushing the data file to the volume failed"
     d=$(sha256sum <"$data.tmp" | cut -d' ' -f1) || die "data: sha256sum failed"
     [ -n "$d" ] || die "data: sha256sum produced no digest"
     mv -f "$data.tmp" "$data" || die "data: renaming the data file failed"
-    sync_file "$data"
+    sync_file "$data" || die "data: flushing the renamed data file to the volume failed"
     printf '%s\n' "$d" >"$sum" || die "data: recording the digest failed"
-    sync_file "$sum"
+    sync_file "$sum" || die "data: flushing the recorded digest to the volume failed"
 fi
 
 # A journal that does not end with a newline was cut mid-append when the previous
@@ -143,31 +165,40 @@ fi
 # than losing the entire history.
 if [ -s "$journal" ] && [ -n "$(tail -c 1 "$journal")" ]; then
     sed '$d' "$journal" >"$journal.trim" && mv -f "$journal.trim" "$journal"
-    sync_file "$journal"
+    sync_file "$journal" || die "journal: flushing the trimmed journal to the volume failed"
 fi
 
 last=$(grep '^ok ' "$journal" 2>/dev/null | cut -d' ' -f2 | grep -E '^[0-9]+$' | tail -n 1)
 [ -n "$last" ] || last=-1
 seq=$((last + 1))
 
-journal_line "start $(now_ms) $$ $data 0:0 $(wc -c <"$data")"
+journal_line "start $(now_ms) $$ $data 0:0 $(wc -c <"$data")" ||
+    die "journal: flushing the start record to the volume failed"
 
 while true; do
     if [ -f "$stop" ]; then
-        journal_line "stopped $seq $(now_ms)"
+        journal_line "stopped $seq $(now_ms)" ||
+            die "journal: flushing the stopped record to the volume failed"
         idle
     fi
 
+    # $ts dates the CONTENT of the record; the beat itself is timestamped below,
+    # once the cycle that verified it has returned.
     ts=$(now_ms)
     payload="beat $seq $ts"
     printf '%s\n' "$payload" >"$beat" || die "io: writing the beat file failed at sequence $seq"
-    sync_file "$beat"
+    sync_file "$beat" || die "io: flushing the beat file to the volume failed at sequence $seq"
     back=$(cat "$beat") || die "io: reading the beat file back failed at sequence $seq"
     if [ "$back" != "$payload" ]; then
         die "readback: sequence $seq differs from what was written"
     fi
     c=$(printf '%s\n' "$payload" | sha256sum | cut -c1-8)
-    journal_line "ok $seq 0 $ts $c"
+    # A FRESH timestamp, taken here: every second the cycle above spent blocked
+    # in the fsync of a frozen volume has to land in the distance to the previous
+    # beat, or a freeze that ended while the stop flag was already up would be
+    # reported by nobody.
+    journal_line "ok $seq 0 $(now_ms) $c" ||
+        die "journal: flushing beat $seq to the volume failed"
     seq=$((seq + 1))
     sleep "$interval"
 done
