@@ -390,8 +390,30 @@ constants, never string literals:
    agents, editing system node labels (for example
    `topology.kubernetes.io/zone`), removing a finalizer by hand, or writing to a
    raw block device. The label auto-injects `Serial` and the lowest spec
-   priority, and the spec is skipped unless `E2E_ALLOW_DISRUPTIVE=true`.
+   priority, and the spec is skipped unless `E2E_ALLOW_DISRUPTIVE=true` or
+   `E2E_RUN_ALL=true`.
+ - `fw.LabelLongHaul` — for specs that are long because they *wait* for the
+   cluster (an alert with `for: 15m` cannot be observed sooner). The label
+   raises the default `SpecTimeout` to 30min and auto-injects the **highest**
+   spec priority, so a parallel run hands the spec to a worker first and its
+   wait overlaps with the rest of the suite. It deliberately does **not** inject
+   `Serial`: serial specs run after every worker has exited, where the wait
+   would overlap nothing. The spec is skipped unless `E2E_ALLOW_LONG_HAUL=true`
+   or `E2E_RUN_ALL=true`; a focused run (`--focus`/`--focus-file`) bypasses this
+   gate, and only this one — focusing says "run this spec", not "you may damage
+   this cluster". A spec carrying both labels keeps the `Disruptive` placement.
  - `fw.LabelFeature*` — one per functional area, for `--label-filter`.
+
+`Disruptive` and `LongHaul` are the opt-in classes. Their gates share one
+formula: the class variable **or** `E2E_RUN_ALL`, each parsed as a boolean
+(`strconv.ParseBool`) — `true`/`1`/`t` enable the class, while unset, `false`
+and any unrecognized value keep it skipped, and `E2E_RUN_ALL=true` wins over a
+`false` class variable. The formula lives in one pure function
+(`optInEnabled`, `e2e/pkg/framework/optin.go`) with a unit test per row, and no
+`Skip` branch reads `os.Getenv` itself. Nothing in the repository sets these
+variables — no workflow runs the e2e suites and `hack/run-e2e-new.sh` only picks
+a label filter — so a document or a `Skip` message MUST tell the reader to
+export them before the run, and MUST NOT suggest CI does it for them.
 
 A spec that mutates state shared with other specs (node labels, RSP/RSC
 selectors used by the whole suite) MUST also be `Serial` — which
@@ -431,12 +453,32 @@ selectors used by the whole suite) MUST also be `Serial` — which
 ## Skips
 
 A skip is not a pass. Every `Skip` MUST state the missing precondition in its
-message, and MUST be reachable only because the *cluster* is too small — never
-because an assertion is inconvenient. Prefer the declarative decorators in
-`e2e/pkg/framework/require` (for example `require.MinNodes(4, 1)`) over ad-hoc
-`Skip` calls. If a scenario can be built on any cluster (for example by carving
-an eligible set out with a temporary label plus a dedicated RSC), build it —
-do not skip.
+message **and how to satisfy it**.
+
+A `Skip` MUST be reachable for one of exactly three reasons:
+
+ 1. **The cluster is too small.** Prefer the declarative decorators in
+    `e2e/pkg/framework/require` (for example `require.MinNodes(4, 1)`) over
+    ad-hoc `Skip` calls.
+ 2. **The cluster lacks a capability the spec asserts against** — a CRD or a
+    module that is not installed (for example `clusteralerts.deckhouse.io` on a
+    stand without Deckhouse observability). Probe the capability, never the
+    vendor's version string.
+ 3. **The spec belongs to an opt-in class whose gate is off** (`Disruptive`,
+    `LongHaul` — see §Labels; the gate formula is the one stated there).
+
+Anything else — an assertion that is inconvenient, a flake, an environment the
+author did not feel like arranging — remains forbidden. If a scenario can be
+built on any cluster (for example by carving an eligible set out with a
+temporary label plus a dedicated RSC), build it — do not skip.
+
+Every gate MUST be an explicit `Skip`. A silent `return`, an `if enabled { … }`
+wrapped around the assertions, or an empty spec body all count as *Passed* in
+the Ginkgo summary and manufacture a green run out of a check that never ran —
+the failure mode opt-in specs are most exposed to, precisely because they are
+off on most runs. Two questions must both answer "yes": with the gate on and the
+feature broken, does the spec fail? With the gate off, does the spec appear in
+the summary as *Skipped* with a reason?
 
 ## File organization
 
