@@ -596,11 +596,11 @@ of them:
    and names `E2E_ALLOW_DISRUPTIVE` / `E2E_RUN_ALL`, which the labelled spec then
    needs in order to run at all.
 
-Guarded today: `f.RebootNode`, `f.StartIOWorkload`, `f.SetNodeLabel` and
-`trvr.RemoveFinalizers` — every framework helper that damages state shared with
-the rest of the suite, so no spec can reach one of them unlabelled, whether it
-calls it directly or through a wrapper. Adding a destructive helper means adding
-the guard call in the same change.
+Guarded today: `f.RebootNode`, `f.StartIOWorkload`, `f.StartPodIOWorkload`,
+`f.SetNodeLabel` and `trvr.RemoveFinalizers` — every framework helper that
+damages state shared with the rest of the suite, so no spec can reach one of them
+unlabelled, whether it calls it directly or through a wrapper. Adding a
+destructive helper means adding the guard call in the same change.
 
 A wrapper around a guarded helper does **not** repeat the guard: `startVolumeIO`
 (`e2e/full/io_helpers_test.go`) only reads before it calls `f.StartIOWorkload`,
