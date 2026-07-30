@@ -174,6 +174,15 @@ func moduleWorkloads() []moduleWorkload {
 // NOTHING is cleaned up and no DeferCleanup is registered: the module is left
 // installed at imageTag on purpose — the state of the stand after a run is the
 // diagnosis material, and retagging it back would destroy it.
+//
+// It is the one helper that damages state shared with the whole cluster and does
+// NOT call RequireDisruptiveSpec, because its designed call site is a
+// pre-discovery hook — a suite-level node, where that guard refuses by
+// construction: such a node takes no decorators, so the label it would demand can
+// never be written on it. The requirement is met one level up instead. A suite
+// that retags a shared module carries LabelDisruptive on its container and
+// refuses to start at all when the class is off (DisruptiveEnabled), which is
+// strictly earlier than a call-site check would fire.
 func (f *Framework) EnsureModuleVersion(ctx context.Context, moduleName, imageTag string, timeout time.Duration) {
 	GinkgoHelper()
 	if timeout <= 0 {
@@ -182,6 +191,39 @@ func (f *Framework) EnsureModuleVersion(ctx context.Context, moduleName, imageTa
 	if err := ensureModuleVersion(ctx, f.Client, f, moduleName, imageTag, timeout, moduleReadyPollInterval); err != nil {
 		Fail(err.Error())
 	}
+}
+
+// ValidateModuleImageTag reports whether imageTag can be used as spec.imageTag of
+// a ModulePullOverride: a non-empty string of printable ASCII characters, with no
+// spaces and no control characters.
+//
+// The rule is deliberately loose about SHAPE. The dev tags of this project are
+// arbitrary — pr758 built by CI from a pull request, main, a branch name — so a
+// pattern like `pr<N>|main` would refuse tags that work. What it does catch is
+// the class of mistakes made while typing a variable on a command line: an empty
+// value, a quoted value that kept its spaces, a trailing newline, a character no
+// registry would accept in a reference.
+//
+// It returns an error instead of failing the spec, for the same reason
+// ParseVolumesOverride does: its caller is a suite's entry point (func TestX,
+// before RunSpecs), where Fail and Skip panic because no node is running. The
+// text is a sentence fragment ("must not be empty"), so both that caller and
+// ensureModuleVersion can prefix it with the subject they are talking about.
+//
+// ensureModuleVersion validates through this very function, so a tag a gate
+// accepted is a tag the helper accepts too.
+func ValidateModuleImageTag(imageTag string) error {
+	if imageTag == "" {
+		return errors.New("must not be empty")
+	}
+	for _, r := range imageTag {
+		// Printable ASCII without the space: '!' (0x21) through '~' (0x7e).
+		if r < '!' || r > '~' {
+			return fmt.Errorf(
+				"must consist of printable ASCII characters without spaces, got %q", imageTag)
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -567,8 +609,8 @@ func ensureModuleVersion(
 	if moduleName == "" {
 		return errors.New("the module name must not be empty")
 	}
-	if imageTag == "" {
-		return fmt.Errorf("the image tag of module %q must not be empty", moduleName)
+	if err := ValidateModuleImageTag(imageTag); err != nil {
+		return fmt.Errorf("the image tag of module %q %w", moduleName, err)
 	}
 
 	before, err := observer.observeModule(ctx, moduleName)

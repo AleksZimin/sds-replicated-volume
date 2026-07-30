@@ -272,6 +272,49 @@ func (s *stubModuleObserver) observeModule(_ context.Context, _ string) (moduleO
 	return answer.obs, answer.err
 }
 
+// The tag rule is what a suite's gate refuses a mistyped E2E_UPGRADE_*_TAG with,
+// before a single object is written, so both directions matter: everything a dev
+// build is actually tagged with has to pass, and everything a shell can smuggle
+// in has to be refused.
+var _ = Describe("ValidateModuleImageTag", func() {
+	DescribeTable("accepts the tags this project builds",
+		func(tag string) {
+			Expect(ValidateModuleImageTag(tag)).To(Succeed())
+		},
+		Entry("a release channel branch", "main"),
+		Entry("a CI build of a pull request", "pr758"),
+		Entry("a branch name with a slash", "feat/r3-r2-auto-migration"),
+		Entry("a semantic version", "v1.2.3-alpha.1"),
+		Entry("a digest-looking tag", "sha256-1111"),
+	)
+
+	DescribeTable("refuses what an operator can mistype",
+		func(tag, wantMessage string) {
+			Expect(ValidateModuleImageTag(tag)).To(MatchError(ContainSubstring(wantMessage)))
+		},
+		Entry("empty", "", "must not be empty"),
+		Entry("a quoted value that kept its spaces", "pr758 ", "printable ASCII"),
+		Entry("a value with a space inside", "two tags", "printable ASCII"),
+		Entry("a tab", "pr758\t", "printable ASCII"),
+		Entry("a trailing newline from a command substitution", "pr758\n", "printable ASCII"),
+		Entry("a non-ASCII character", "prесемьсотпятьдесятвосемь", "printable ASCII"),
+	)
+
+	It("is the rule ensureModuleVersion applies, so a gate and the helper agree", func() {
+		c := newModuleClient()
+		observer := &stubModuleObserver{script: []moduleAnswer{
+			{obs: readyObservation(testTagOld, testDigestOld, testImageOld)},
+		}}
+
+		err := ensureModuleVersion(context.Background(), c, observer, ModuleName, "pr758 ",
+			time.Second, time.Millisecond)
+
+		Expect(err).To(MatchError(ContainSubstring("printable ASCII")))
+		Expect(c.creates).To(BeZero())
+		Expect(c.updates).To(BeZero())
+	})
+})
+
 var _ = Describe("buildModuleConfig", func() {
 	It("enables the module and touches nothing else", func() {
 		mc := buildModuleConfig(ModuleName)
