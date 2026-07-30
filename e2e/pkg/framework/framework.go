@@ -120,9 +120,13 @@ type SetupOption func(*Framework)
 // it returns fails the suite.
 //
 // It runs in the SECOND function of SynchronizedBeforeSuite, i.e. once per
-// Ginkgo worker. A suite using it is expected to run with --procs=1 (exactly one
-// call), and the hook MUST still be idempotent so that an accidental parallel
-// run only slows the suite down instead of breaking it.
+// Ginkgo worker, and every worker enters it at the same time. A suite using it is
+// expected to run with --procs=1 (exactly one call), and the hook MUST still be
+// idempotent so that an accidental parallel run only slows the suite down instead
+// of breaking it. Idempotent here has to include losing a write to a sibling
+// worker: two callers reading the same object and then writing it get
+// AlreadyExists or Conflict, and a hook that reports those as errors fails the
+// suite (EnsureModuleVersion re-reads and retakes the decision instead).
 //
 // Default (option not passed): no hook, and Setup behaves exactly as before.
 func WithPreDiscovery(hook func(ctx context.Context, f *Framework) error) SetupOption {

@@ -134,22 +134,41 @@ func moduleWorkloads() []moduleWorkload {
 //   - each workload is rollout-complete (its controller observed the current
 //     generation, every pod runs the current template, no pod of an older
 //     template is left) and reports its pods available and ready;
-//   - and, when this call retagged a live MPO, status.imageDigest of that MPO
-//     differs from the digest observed BEFORE the write. That bundle digest is
-//     the primary proof that Deckhouse pulled the new build; an absent or empty
-//     digest means "no signal yet" and the wait continues. After a retag the
-//     whole criterion additionally has to hold on two consecutive polls, so that
-//     a sample taken between the new digest and the re-apply of the manifests is
-//     not mistaken for a finished rollout (see moduleReadyConfirmations).
+//   - and status.imageDigest of the MPO shows the transition the state before
+//     the write implies (moduleDigestRequirement): a digest DIFFERENT from the
+//     one observed before, when a live override was retagged, and merely a
+//     PUBLISHED one when there was no override at all. That bundle digest is the
+//     only signal in the cluster that Deckhouse has looked at the override; an
+//     absent or empty digest means "no signal yet" and the wait continues.
+//     Requiring it on the create path is what keeps a first installation over an
+//     ALREADY RUNNING module honest — a module installed from a release channel
+//     keeps its healthy workloads while the new override is picked up, and
+//     accepting them would report a version the module is not running. Whenever
+//     a digest is required, the whole criterion additionally has to hold on two
+//     consecutive polls, so that a sample taken between the digest and the
+//     re-apply of the manifests is not mistaken for a finished rollout (see
+//     moduleReadyConfirmations).
 //
 // Pod-template digests are reported as progress but deliberately NOT required to
 // change: werf builds are content-addressed, so a component untouched between
 // the two tags keeps its digest, and demanding a change would hang forever on
-// close dev builds.
+// close dev builds. Together with the two confirmations, the published digest is
+// as far as Deckhouse's own signals reach — there is no per-module "the
+// manifests of THIS bundle are applied" status to wait for. A re-apply that
+// lands more than a poll interval after the digest can therefore still overlap
+// the caller's first spec; that residual overlap is traded against a criterion
+// that would hang on two builds rendering identical manifests.
 //
-// Idempotent. A repeat call with the tag already in the live MPO writes nothing
-// and only re-checks the rollout, so the helper is safe as a pre-discovery hook
-// that may run on more than one Ginkgo worker (see WithPreDiscovery).
+// Idempotent, and safe to run concurrently with itself on the same tag — which
+// is what makes it usable as a pre-discovery hook Ginkgo runs once per worker
+// (see WithPreDiscovery). A repeat call with the tag already in the live MPO
+// writes nothing and only re-checks the rollout. A concurrent call that wins a
+// write leaves this one with AlreadyExists (both created) or Conflict (both
+// updated); both mean "somebody wrote what I was about to write", so the object
+// is re-read and the decision retaken instead of failing the suite (see
+// retryOnModuleWriteRace). What is AWAITED is derived from the state observed
+// before the write, so the caller whose write was won still waits for the digest
+// transition rather than accepting the build the stand ran before.
 //
 // timeout budgets the whole readiness wait; 0 means DefaultModuleReadyTimeout.
 // NOTHING is cleaned up and no DeferCleanup is registered: the module is left
@@ -383,32 +402,95 @@ func podTemplateImages(template *corev1.PodTemplateSpec) []string {
 // Readiness criterion
 // ---------------------------------------------------------------------------
 
+// moduleDigestRequirement is what the readiness criterion demands of
+// ModulePullOverride status.imageDigest — the digest of the module bundle
+// Deckhouse resolved the tag to, and the only signal in the cluster that
+// Deckhouse has looked at the override at all.
+type moduleDigestRequirement int
+
+const (
+	// digestIgnored demands nothing: the override already pinned the tag before
+	// the call, so no digest transition is coming and the rollout of the
+	// workloads is the whole criterion.
+	digestIgnored moduleDigestRequirement = iota
+
+	// digestPublished demands a non-empty digest. There was no override before
+	// the call, so ANY digest is one Deckhouse published for ours — and until it
+	// appears, the workloads a poll sees are the ones of whatever ran BEFORE the
+	// override. On a stand that already runs the module from a release channel
+	// those workloads are perfectly healthy, so a criterion that ignores the
+	// digest here would report "ready" on the OLD build the instant the override
+	// was created, before Deckhouse noticed it. On a genuinely first installation
+	// the demand costs nothing: Deckhouse resolves the tag and publishes the
+	// digest before a single workload of the module exists. A Deckhouse that never
+	// publishes the field at all would time the wait out with that reason spelled
+	// in the message — the same dependency the retag path already lives with, and
+	// status.imageDigest is present on the v1alpha2 override this suite targets.
+	digestPublished
+
+	// digestChanged demands a non-empty digest OTHER than the one observed before
+	// the write: a live override was retagged, so the digest it carried belongs to
+	// the previous bundle and only a different one proves the new one was pulled.
+	digestChanged
+)
+
+// String renders the requirement for the progress line.
+func (r moduleDigestRequirement) String() string {
+	switch r {
+	case digestPublished:
+		return "published"
+	case digestChanged:
+		return "changed"
+	default:
+		return "not required"
+	}
+}
+
 // moduleReadiness is what one readiness poll is waiting for: the rollout of
-// every expected workload, plus — after a retag — a bundle digest different from
-// the one the override carried before the write.
+// every expected workload, plus the bundle digest transition the state before the
+// write implies.
 type moduleReadiness struct {
 	// DigestBefore is MPO status.imageDigest as observed BEFORE the write ("" if
 	// there was no override or no digest yet).
 	DigestBefore string
-	// RequireDigestChange is set only when this call retagged a LIVE override.
-	// A first installation and a no-op call have no digest to compare against.
-	RequireDigestChange bool
+	// Digest is what status.imageDigest has to show — see
+	// moduleDigestRequirement and moduleDigestRequirementFor.
+	Digest moduleDigestRequirement
 	// ImagesBefore is the pod-template image set per workload before the write,
 	// keyed by workload. Progress reporting only — see moduleImagesChanged.
 	ImagesBefore map[string][]string
 }
 
+// moduleDigestRequirementFor decides what the criterion demands of the bundle
+// digest, from the state observed BEFORE the write rather than from what the
+// write turned out to do.
+//
+// The two differ only when a concurrent caller wrote the same tag first (see
+// retryOnModuleWriteRace): that write path then reports "unchanged", while the
+// cluster still owes THIS caller the transition its own snapshot did not have.
+// Deriving the demand from the snapshot keeps every racing caller waiting for the
+// same thing instead of letting the one that lost the write accept the build the
+// stand ran before.
+func moduleDigestRequirementFor(before moduleObservation, imageTag string) moduleDigestRequirement {
+	switch {
+	case !before.MPOFound:
+		return digestPublished
+	case before.MPOTag != imageTag:
+		return digestChanged
+	default:
+		return digestIgnored
+	}
+}
+
 // checkModuleReady reports nil when the observation satisfies the criterion, and
 // otherwise the reason it does not — the message a timeout would carry.
 func checkModuleReady(want moduleReadiness, obs moduleObservation) error {
-	if want.RequireDigestChange {
-		switch obs.MPODigest {
-		case "":
-			return fmt.Errorf("%s carries no status.imageDigest yet", gvkModulePullOverride.Kind)
-		case want.DigestBefore:
-			return fmt.Errorf("%s still reports the bundle digest it had before the retag (%s)",
-				gvkModulePullOverride.Kind, want.DigestBefore)
-		}
+	if want.Digest != digestIgnored && obs.MPODigest == "" {
+		return fmt.Errorf("%s carries no status.imageDigest yet", gvkModulePullOverride.Kind)
+	}
+	if want.Digest == digestChanged && obs.MPODigest == want.DigestBefore {
+		return fmt.Errorf("%s still reports the bundle digest it had before the retag (%s)",
+			gvkModulePullOverride.Kind, want.DigestBefore)
 	}
 	// An observation with no workloads at all would make every rollout claim
 	// below vacuously true.
@@ -504,24 +586,89 @@ func ensureModuleVersion(
 	}
 
 	want := moduleReadiness{
-		DigestBefore:        before.MPODigest,
-		RequireDigestChange: overrideAction == moduleObjectUpdated,
-		ImagesBefore:        observationImages(before),
+		DigestBefore: before.MPODigest,
+		Digest:       moduleDigestRequirementFor(before, imageTag),
+		ImagesBefore: observationImages(before),
 	}
 
 	fmt.Fprintf(GinkgoWriter,
 		"[%s] [module] %s: ModuleConfig %s, ModulePullOverride %s (tag %q -> %q), digest before %q; "+
-			"waiting up to %s for the rollout (digest change required: %t)\n",
+			"waiting up to %s for the rollout (bundle digest: %s)\n",
 		time.Now().Format("15:04:05.000"), moduleName, configAction, overrideAction,
-		previousTag, imageTag, before.MPODigest, timeout, want.RequireDigestChange)
+		previousTag, imageTag, before.MPODigest, timeout, want.Digest)
 
 	return awaitModuleReady(ctx, observer, moduleName, want, timeout, poll)
+}
+
+// moduleWriteAttempts bounds how many times a create-or-update is retaken after
+// another writer got there first. Two passes settle the race this helper actually
+// meets — an accidental --procs>1, where every worker aims at the SAME tag, so
+// the pass after the lost write finds the object already correct and writes
+// nothing; the third is slack for a stand where somebody edits the object by hand
+// at the same moment.
+const moduleWriteAttempts = 3
+
+// retryOnModuleWriteRace re-drives a create-or-update whose write lost a race;
+// what names the write, and prefixes both the progress line and the error this
+// gives up with.
+//
+// AlreadyExists means somebody created the object between our Get and our
+// Create; Conflict means somebody updated it between our Get and our Update.
+// Both are answered the same way — re-read the object and take the decision
+// again — because the writer that beat us is another Ginkgo worker of this very
+// suite aiming at the same tag, so the next pass converges. Neither is allowed to
+// reach the caller as a failure: the pre-discovery hook runs once per worker, and
+// an accidental parallel run has to slow the suite down instead of breaking it.
+//
+// Any other error is returned as it is: a write that failed on its own merits is
+// not improved by repeating it. This retry cannot live in retryTransport either —
+// that one retries transport-level failures (>=500) and has no way to re-read an
+// object and rebuild the request body, which is the whole point here.
+func retryOnModuleWriteRace(what string, attempt func() error) error {
+	var err error
+	for i := 1; i <= moduleWriteAttempts; i++ {
+		if err = attempt(); err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) && !apierrors.IsConflict(err) {
+			return err
+		}
+		fmt.Fprintf(GinkgoWriter,
+			"[%s] [module] %s: another writer got there first (attempt %d/%d: %v), re-reading\n",
+			time.Now().Format("15:04:05.000"), what, i, moduleWriteAttempts, err)
+	}
+	return fmt.Errorf("%s: another writer kept winning through %d attempts: %w", what, moduleWriteAttempts, err)
 }
 
 // ensureModuleConfigEnabled makes sure the module's ModuleConfig exists and is
 // enabled, touching nothing else: a stand's settings and version are its own,
 // and Deckhouse ignores a ModulePullOverride of a disabled module.
+//
+// A write a concurrent caller won is retaken on a re-read object — see
+// retryOnModuleWriteRace.
 func ensureModuleConfigEnabled(
+	ctx context.Context,
+	c moduleObjectClient,
+	moduleName string,
+) (moduleObjectAction, error) {
+	var action moduleObjectAction
+	err := retryOnModuleWriteRace(
+		fmt.Sprintf("enabling %s %q", gvkModuleConfig.Kind, moduleName),
+		func() error {
+			var err error
+			action, err = ensureModuleConfigEnabledOnce(ctx, c, moduleName)
+			return err
+		})
+	if err != nil {
+		return "", err
+	}
+	return action, nil
+}
+
+// ensureModuleConfigEnabledOnce is one pass of the ModuleConfig create-or-update:
+// read, decide, write. It hands AlreadyExists and Conflict to its caller rather
+// than handling them, because deciding again requires the object to be read again.
+func ensureModuleConfigEnabledOnce(
 	ctx context.Context,
 	c moduleObjectClient,
 	moduleName string,
@@ -563,7 +710,39 @@ func ensureModuleConfigEnabled(
 // absent, so an override a stand configured on purpose is not overwritten. An
 // override that already pins imageTag is not written at all — that no-op is what
 // makes the helper idempotent.
+//
+// A write a concurrent caller won is retaken on a re-read object — see
+// retryOnModuleWriteRace. Note what the retry then reports: a sibling that
+// created or retagged the object to the SAME tag first leaves this call with
+// "unchanged", which is why the readiness criterion derives its demand from the
+// pre-write snapshot and not from this action (moduleDigestRequirementFor).
 func ensureModulePullOverride(
+	ctx context.Context,
+	c moduleObjectClient,
+	moduleName, imageTag string,
+) (moduleObjectAction, string, error) {
+	var (
+		action      moduleObjectAction
+		previousTag string
+	)
+	err := retryOnModuleWriteRace(
+		fmt.Sprintf("pinning %s %q to tag %q", gvkModulePullOverride.Kind, moduleName, imageTag),
+		func() error {
+			var err error
+			action, previousTag, err = ensureModulePullOverrideOnce(ctx, c, moduleName, imageTag)
+			return err
+		})
+	if err != nil {
+		return "", "", err
+	}
+	return action, previousTag, nil
+}
+
+// ensureModulePullOverrideOnce is one pass of the ModulePullOverride
+// create-or-update: read, decide, write. It hands AlreadyExists and Conflict to
+// its caller rather than handling them, because deciding again requires the
+// object to be read again.
+func ensureModulePullOverrideOnce(
 	ctx context.Context,
 	c moduleObjectClient,
 	moduleName, imageTag string,
@@ -654,23 +833,24 @@ func fillModulePullOverrideDefaults(u *unstructured.Unstructured) error {
 }
 
 // moduleReadyConfirmations is how many CONSECUTIVE polls must accept the state
-// after a retag before the module counts as rolled out.
+// before a module whose bundle digest was awaited counts as rolled out.
 //
-// Deckhouse publishes the new bundle digest before it re-applies the module's
-// manifests, so a single sample taken inside that window would see the new
-// digest next to workloads still calmly running the OLD template — and call the
-// upgrade finished. Demanding the criterion twice, one poll interval apart,
-// closes the window: the re-apply lands within seconds, and the second sample
-// already sees the generation bump (or the pod restarts it causes) and rejects
-// it.
+// Deckhouse publishes the bundle digest before it re-applies the module's
+// manifests, so a single sample taken inside that window would see the digest
+// next to workloads still calmly running the OLD template — and call the upgrade
+// (or the takeover of a module the stand already ran) finished. Demanding the
+// criterion twice, one poll interval apart, closes the window: the re-apply lands
+// within seconds, and the second sample already sees the generation bump (or the
+// pod restarts it causes) and rejects it.
 //
 // It cannot deadlock on a pair of tags whose workloads are byte-identical:
 // nothing is required to CHANGE here, the same accepted state merely has to be
 // observed twice.
 const moduleReadyConfirmations = 2
 
-// awaitModuleReady polls the module until the criterion accepts it (twice, after
-// a retag — see moduleReadyConfirmations), the budget runs out, or ctx ends.
+// awaitModuleReady polls the module until the criterion accepts it (twice, when a
+// bundle digest is demanded — see moduleReadyConfirmations), the budget runs out,
+// or ctx ends.
 //
 // A failed read is not a verdict: a module rollout restarts the very webhooks
 // and API extensions the read goes through, so a read error counts as "not yet"
@@ -684,7 +864,7 @@ func awaitModuleReady(
 	timeout, poll time.Duration,
 ) error {
 	required := 1
-	if want.RequireDigestChange {
+	if want.Digest != digestIgnored {
 		required = moduleReadyConfirmations
 	}
 
@@ -712,7 +892,7 @@ func awaitModuleReady(
 		if last == nil {
 			// Accepted, but not yet confirmed by another poll.
 			last = fmt.Errorf("the module looks rolled out, but the state held for %d of the %d polls"+
-				" required to rule out a sample taken between the new digest and the re-apply",
+				" required to rule out a sample taken between the bundle digest and the re-apply",
 				accepted, required)
 		}
 		if !time.Now().Before(deadline) {

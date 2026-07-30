@@ -19,12 +19,14 @@ package framework
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -99,9 +101,79 @@ func modulePullOverrideObject(spec map[string]any) *unstructured.Unstructured {
 	return u
 }
 
+// racingModuleClient models the write race an accidental --procs>1 creates: a
+// sibling worker aiming at the SAME tag lands its write between our Get and our
+// write, so ours is answered with AlreadyExists or Conflict. The sibling writes
+// through the wrapped client, so the error our write gets is the fake API
+// server's own — resourceVersion semantics included — and not a hand-made one.
+// The counters cover OUR writes only.
+type racingModuleClient struct {
+	moduleObjectClient
+	racesLost int
+	creates   int
+	updates   int
+}
+
+func newRacingModuleClient(racesLost int, objs ...client.Object) *racingModuleClient {
+	return &racingModuleClient{
+		moduleObjectClient: fake.NewClientBuilder().WithScheme(moduleScheme()).WithObjects(objs...).Build(),
+		racesLost:          racesLost,
+	}
+}
+
+// letSiblingWin performs the write we were about to perform, on a copy of the
+// object: what we hold is then either taken (Create) or stale (Update).
+func (c *racingModuleClient) letSiblingWin(obj client.Object, write func(client.Object) error) error {
+	if c.racesLost <= 0 {
+		return nil
+	}
+	c.racesLost--
+	sibling, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return fmt.Errorf("%T is not a client.Object", obj)
+	}
+	return write(sibling)
+}
+
+func (c *racingModuleClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if err := c.letSiblingWin(obj, func(sibling client.Object) error {
+		return c.moduleObjectClient.Create(ctx, sibling)
+	}); err != nil {
+		return err
+	}
+	c.creates++
+	return c.moduleObjectClient.Create(ctx, obj, opts...)
+}
+
+func (c *racingModuleClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if err := c.letSiblingWin(obj, func(sibling client.Object) error {
+		return c.moduleObjectClient.Update(ctx, sibling)
+	}); err != nil {
+		return err
+	}
+	c.updates++
+	return c.moduleObjectClient.Update(ctx, obj, opts...)
+}
+
+// stuckModuleClient answers every Update the way the API server answers a writer
+// whose object was modified under it, and never lets the state converge — a stand
+// where somebody keeps rewriting the object under us. The conflict it reports
+// names the ModuleConfig resource, the only write path it is used on.
+type stuckModuleClient struct {
+	moduleObjectClient
+	updates int
+}
+
+func (c *stuckModuleClient) Update(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
+	c.updates++
+	return apierrors.NewConflict(
+		schema.GroupResource{Group: gvkModuleConfig.Group, Resource: "moduleconfigs"},
+		obj.GetName(), errors.New("the object has been modified"))
+}
+
 // readModuleObject reads one of the two Deckhouse objects back out of the fake
 // cluster.
-func readModuleObject(c *countingModuleClient, gvk schema.GroupVersionKind) *unstructured.Unstructured {
+func readModuleObject(c moduleObjectClient, gvk schema.GroupVersionKind) *unstructured.Unstructured {
 	out := &unstructured.Unstructured{}
 	out.SetGroupVersionKind(gvk)
 	ExpectWithOffset(1, c.Get(context.Background(), client.ObjectKey{Name: ModuleName}, out)).To(Succeed())
@@ -149,13 +221,23 @@ func readyWorkloadState(w moduleWorkload, image string) moduleWorkloadState {
 	}
 }
 
-// readyObservation builds an observation in which the override reports digest and
-// every expected workload finished rolling out on image.
-func readyObservation(tag, digest, image string) moduleObservation {
-	obs := moduleObservation{MPOFound: true, MPOTag: tag, MPODigest: digest}
+// releaseObservation builds an observation of a stand that runs the module with
+// NO ModulePullOverride at all — installed from a release channel — with every
+// expected workload healthy on image. It is the state in which creating an
+// override must not be mistaken for a finished rollout.
+func releaseObservation(image string) moduleObservation {
+	var obs moduleObservation
 	for _, w := range moduleWorkloads() {
 		obs.Workloads = append(obs.Workloads, readyWorkloadState(w, image))
 	}
+	return obs
+}
+
+// readyObservation builds an observation in which the override reports digest and
+// every expected workload finished rolling out on image.
+func readyObservation(tag, digest, image string) moduleObservation {
+	obs := releaseObservation(image)
+	obs.MPOFound, obs.MPOTag, obs.MPODigest = true, tag, digest
 	return obs
 }
 
@@ -268,6 +350,39 @@ var _ = Describe("ensureModuleConfigEnabled", func() {
 		Expect(c.creates).To(BeZero())
 		Expect(c.updates).To(BeZero())
 	})
+
+	It("retakes a create a sibling worker won", func() {
+		c := newRacingModuleClient(1)
+
+		action, err := ensureModuleConfigEnabled(context.Background(), c, ModuleName)
+
+		Expect(err).NotTo(HaveOccurred(), "AlreadyExists means the sibling wrote what we were about to write")
+		Expect(action).To(Equal(moduleObjectUnchanged))
+		Expect(c.creates).To(Equal(1), "the second pass finds the object already enabled")
+		Expect(specBool(readModuleObject(c, gvkModuleConfig), "spec", "enabled")).To(BeTrue())
+	})
+
+	It("retakes an update a sibling worker won", func() {
+		c := newRacingModuleClient(1, moduleConfigObject(map[string]any{"enabled": false}))
+
+		action, err := ensureModuleConfigEnabled(context.Background(), c, ModuleName)
+
+		Expect(err).NotTo(HaveOccurred(), "Conflict means the sibling wrote what we were about to write")
+		Expect(action).To(Equal(moduleObjectUnchanged))
+		Expect(c.updates).To(Equal(1), "the second pass finds the object already enabled")
+		Expect(specBool(readModuleObject(c, gvkModuleConfig), "spec", "enabled")).To(BeTrue())
+	})
+
+	It("gives up when a conflicting writer never lets the state converge", func() {
+		c := &stuckModuleClient{
+			moduleObjectClient: newModuleClient(moduleConfigObject(map[string]any{"enabled": false})),
+		}
+
+		_, err := ensureModuleConfigEnabled(context.Background(), c, ModuleName)
+
+		Expect(err).To(MatchError(ContainSubstring("another writer kept winning through 3 attempts")))
+		Expect(c.updates).To(Equal(moduleWriteAttempts))
+	})
 })
 
 var _ = Describe("ensureModulePullOverride", func() {
@@ -329,23 +444,76 @@ var _ = Describe("ensureModulePullOverride", func() {
 		Expect(c.creates).To(BeZero())
 		Expect(c.updates).To(BeZero())
 	})
+
+	It("retakes a create a sibling worker won", func() {
+		c := newRacingModuleClient(1)
+
+		action, previousTag, err := ensureModulePullOverride(context.Background(), c, ModuleName, testTagNew)
+
+		Expect(err).NotTo(HaveOccurred(), "AlreadyExists means the sibling pinned the tag we were pinning")
+		Expect(action).To(Equal(moduleObjectUnchanged))
+		Expect(previousTag).To(Equal(testTagNew))
+		Expect(c.creates).To(Equal(1))
+		Expect(specString(readModuleObject(c, gvkModulePullOverride), "spec", "imageTag")).To(Equal(testTagNew))
+	})
+
+	It("retakes a retag a sibling worker won", func() {
+		c := newRacingModuleClient(1, modulePullOverrideObject(map[string]any{"imageTag": testTagOld}))
+
+		action, previousTag, err := ensureModulePullOverride(context.Background(), c, ModuleName, testTagNew)
+
+		Expect(err).NotTo(HaveOccurred(), "Conflict means the sibling retagged to the tag we were pinning")
+		Expect(action).To(Equal(moduleObjectUnchanged))
+		Expect(previousTag).To(Equal(testTagNew))
+		Expect(c.updates).To(Equal(1))
+		Expect(specString(readModuleObject(c, gvkModulePullOverride), "spec", "imageTag")).To(Equal(testTagNew))
+	})
+})
+
+var _ = Describe("moduleDigestRequirementFor", func() {
+	DescribeTable("derives what the criterion must demand from the state before the write",
+		func(before moduleObservation, want moduleDigestRequirement) {
+			Expect(moduleDigestRequirementFor(before, testTagNew)).To(Equal(want))
+		},
+		Entry("no override existed, so any published digest is ours",
+			moduleObservation{}, digestPublished),
+		Entry("no override existed even though the module was running",
+			releaseObservation(testImageOld), digestPublished),
+		Entry("a live override pinned another tag, so the digest it carries is stale",
+			readyObservation(testTagOld, testDigestOld, testImageOld), digestChanged),
+		Entry("the tag was already pinned, so no digest transition is coming",
+			readyObservation(testTagNew, testDigestOld, testImageOld), digestIgnored),
+	)
 })
 
 var _ = Describe("checkModuleReady", func() {
-	retagged := moduleReadiness{DigestBefore: testDigestOld, RequireDigestChange: true}
+	retagged := moduleReadiness{DigestBefore: testDigestOld, Digest: digestChanged}
+	created := moduleReadiness{Digest: digestPublished}
 
 	It("accepts a rolled-out module when no digest change is expected", func() {
 		Expect(checkModuleReady(moduleReadiness{},
 			readyObservation(testTagOld, testDigestOld, testImageOld))).To(Succeed())
 	})
 
+	It("keeps waiting while an override this call created carries no digest", func() {
+		err := checkModuleReady(created, readyObservation(testTagNew, "", testImageOld))
+
+		Expect(err).To(MatchError(ContainSubstring("carries no status.imageDigest yet")),
+			"the healthy workloads are the release build's until Deckhouse resolves our tag")
+	})
+
+	It("accepts an override this call created once Deckhouse published a digest", func() {
+		Expect(checkModuleReady(created, readyObservation(testTagNew, testDigestNew, testImageNew))).
+			To(Succeed())
+	})
+
 	It("accepts a retag whose pod templates did NOT change", func() {
 		before := readyObservation(testTagOld, testDigestOld, testImageOld)
 		after := readyObservation(testTagNew, testDigestNew, testImageOld)
 		want := moduleReadiness{
-			DigestBefore:        testDigestOld,
-			RequireDigestChange: true,
-			ImagesBefore:        observationImages(before),
+			DigestBefore: testDigestOld,
+			Digest:       digestChanged,
+			ImagesBefore: observationImages(before),
 		}
 
 		Expect(checkModuleReady(want, after)).To(Succeed(),
@@ -440,7 +608,7 @@ var _ = Describe("awaitModuleReady", func() {
 			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
 			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
 		}}
-		want := moduleReadiness{DigestBefore: testDigestOld, RequireDigestChange: true}
+		want := moduleReadiness{DigestBefore: testDigestOld, Digest: digestChanged}
 
 		Expect(awaitModuleReady(ctx, observer, ModuleName, want, 5*time.Second, time.Millisecond)).To(Succeed())
 		Expect(observer.reads).To(Equal(3), "one rejected poll, then the accepting one and its confirmation")
@@ -455,7 +623,7 @@ var _ = Describe("awaitModuleReady", func() {
 				{obs: rolling},
 				{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
 			}}
-			want := moduleReadiness{DigestBefore: testDigestOld, RequireDigestChange: true}
+			want := moduleReadiness{DigestBefore: testDigestOld, Digest: digestChanged}
 
 			Expect(awaitModuleReady(ctx, observer, ModuleName, want, 5*time.Second, time.Millisecond)).To(Succeed())
 			Expect(observer.reads).To(Equal(4),
@@ -466,7 +634,7 @@ var _ = Describe("awaitModuleReady", func() {
 		observer := &stubModuleObserver{script: []moduleAnswer{
 			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
 		}}
-		want := moduleReadiness{DigestBefore: testDigestOld, RequireDigestChange: true}
+		want := moduleReadiness{DigestBefore: testDigestOld, Digest: digestChanged}
 
 		err := awaitModuleReady(ctx, observer, ModuleName, want, 0, time.Millisecond)
 
@@ -477,7 +645,7 @@ var _ = Describe("awaitModuleReady", func() {
 		observer := &stubModuleObserver{script: []moduleAnswer{
 			{obs: readyObservation(testTagNew, testDigestOld, testImageOld)},
 		}}
-		want := moduleReadiness{DigestBefore: testDigestOld, RequireDigestChange: true}
+		want := moduleReadiness{DigestBefore: testDigestOld, Digest: digestChanged}
 
 		err := awaitModuleReady(ctx, observer, ModuleName, want, 10*time.Millisecond, time.Millisecond)
 
@@ -570,10 +738,52 @@ var _ = Describe("ensureModuleVersion", func() {
 			5*time.Second, time.Millisecond)).To(Succeed())
 
 		Expect(c.creates).To(Equal(2), "the ModuleConfig and the ModulePullOverride")
-		Expect(observer.reads).To(Equal(3))
+		Expect(observer.reads).To(Equal(4),
+			"the pre-write snapshot, the poll without a digest, the accepting poll and its confirmation")
 		Expect(specBool(readModuleObject(c, gvkModuleConfig), "spec", "enabled")).To(BeTrue())
 		Expect(specString(readModuleObject(c, gvkModulePullOverride), "spec", "imageTag")).
 			To(Equal(testTagOld))
+	})
+
+	It("does not accept the build a stand already runs as the version it just pinned", func(ctx SpecContext) {
+		pinnedNotResolved := releaseObservation(testImageOld)
+		pinnedNotResolved.MPOFound, pinnedNotResolved.MPOTag = true, testTagNew
+		c := newModuleClient(moduleConfigObject(map[string]any{"enabled": true}))
+		observer := &stubModuleObserver{script: []moduleAnswer{
+			// Before the write: no override, and every workload of the module healthy
+			// on the build a release channel installed.
+			{obs: releaseObservation(testImageOld)},
+			// Our override exists; Deckhouse has not resolved the tag yet, so the
+			// healthy workloads are still the release build's.
+			{obs: pinnedNotResolved},
+			{obs: pinnedNotResolved},
+			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
+			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
+		}}
+
+		Expect(ensureModuleVersion(ctx, c, observer, ModuleName, testTagNew,
+			5*time.Second, time.Millisecond)).To(Succeed())
+
+		Expect(observer.reads).To(Equal(5),
+			"a populated namespace with no digest published is not readiness, however healthy it looks")
+		Expect(c.creates).To(Equal(1), "only the ModulePullOverride, the ModuleConfig was already enabled")
+	})
+
+	It("keeps waiting for the digest when a sibling worker pinned the tag first", func(ctx SpecContext) {
+		c := newRacingModuleClient(2, moduleConfigObject(map[string]any{"enabled": false}))
+		observer := &stubModuleObserver{script: []moduleAnswer{
+			{obs: releaseObservation(testImageOld)}, // before the write: no override
+			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
+			{obs: readyObservation(testTagNew, testDigestNew, testImageNew)},
+		}}
+
+		Expect(ensureModuleVersion(ctx, c, observer, ModuleName, testTagNew,
+			5*time.Second, time.Millisecond)).To(Succeed())
+
+		Expect(observer.reads).To(Equal(3),
+			"the write reports 'unchanged', but the snapshot had no override, so a digest is still awaited")
+		Expect(specBool(readModuleObject(c, gvkModuleConfig), "spec", "enabled")).To(BeTrue())
+		Expect(specString(readModuleObject(c, gvkModulePullOverride), "spec", "imageTag")).To(Equal(testTagNew))
 	})
 
 	DescribeTable("refuses to write anything on invalid input",
