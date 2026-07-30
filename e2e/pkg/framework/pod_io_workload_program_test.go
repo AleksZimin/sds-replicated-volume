@@ -542,6 +542,149 @@ var _ = Describe("PodIOWorkload writer program, against a volume that stops flus
 	})
 })
 
+// Dropping the partial last record of a journal a dead container left behind is
+// the one repair this writer performs, and a repair that quietly did nothing is
+// worse than no repair at all: the writer would append to that journal anyway and
+// leave the partial record in its MIDDLE, where it makes the whole history
+// unreadable — or, cut at the right byte, where the next append completes it into
+// a beat nobody ever verified. The specs below stub the tools the trim is made of,
+// so the trim fails on a volume that is otherwise perfectly healthy, which is the
+// only way that failure is reachable without breaking everything else with it.
+var _ = Describe("PodIOWorkload writer program, whose journal cannot be trimmed", func() {
+	const (
+		wait = 15 * time.Second
+		poll = 100 * time.Millisecond
+
+		// Three beat intervals: long enough for a writer that trimmed nothing and
+		// carried on to have appended its start record and a couple of beats.
+		appendWatch = 3 * time.Second
+
+		// The journal a dead container left behind: two published beats and a third
+		// record cut in the middle of its timestamp. Cut THERE on purpose — the
+		// fragment is then unparsable on its own, which is what parseIOJournal
+		// tolerates on a last line, and unparsable after any append too, which is
+		// what it refuses anywhere else.
+		partialJournal = "start 1750000000000 7 /data/io/data 0:0 256\n" +
+			"ok 0 0 1750000000001 aaaaaaaa\n" +
+			"ok 1 0 1750000000002 bbbbbbbb\n" +
+			"ok 2 0 17500"
+	)
+
+	var dir, journal, stubDir, logPath string
+
+	BeforeEach(func() {
+		for _, bin := range []string{"sh", "sha256sum", "date", "sed", "grep", "cut", "tail", "wc", "mv", "rm", "sleep"} {
+			if _, err := exec.LookPath(bin); err != nil {
+				Skip("the writer program cannot be executed here: " + bin + " is missing")
+			}
+		}
+		// A shell that carries sed(1) or mv(1) as a BUILT-IN never consults PATH, so
+		// the stub would never be reached: the trim would succeed and the spec would
+		// wait out its timeouts instead of testing anything.
+		for _, bin := range []string{"sed", "mv"} {
+			out, err := exec.Command("sh", "-c", "command -v "+bin).Output()
+			if err != nil || !strings.HasPrefix(strings.TrimSpace(string(out)), "/") {
+				Skip("the shell here does not resolve " + bin + "(1) through PATH, so the trim cannot be stubbed")
+			}
+		}
+
+		root := GinkgoT().TempDir()
+		dir = filepath.Join(root, "io")
+		journal = filepath.Join(dir, "journal")
+		stubDir = filepath.Join(root, "bin")
+		logPath = filepath.Join(root, "writer.log")
+		Expect(os.MkdirAll(dir, 0o700)).To(Succeed())
+		Expect(os.MkdirAll(stubDir, 0o700)).To(Succeed())
+		Expect(os.WriteFile(journal, []byte(partialJournal), 0o600)).To(Succeed())
+	})
+
+	// start installs stub as the tool the writer will find under name and launches
+	// the writer with it on PATH. The writer is LEFT RUNNING: it must idle after the
+	// failure, not exit, so that the journal it refused to touch stays readable
+	// through an exec into the container.
+	start := func(name, stub string) {
+		GinkgoHelper()
+		Expect(os.WriteFile(filepath.Join(stubDir, name), []byte(stub), 0o700)).To(Succeed())
+
+		script := strings.Join([]string{
+			"dir=" + dir, "interval=1", "records=4",
+			"record='" + podIODataRecord + "'", "", podIOWorkloadProgram,
+		}, "\n")
+		path := filepath.Join(filepath.Dir(dir), "writer.sh")
+		Expect(os.WriteFile(path, []byte(script), 0o600)).To(Succeed())
+		log, err := os.Create(logPath)
+		Expect(err).NotTo(HaveOccurred())
+
+		cmd := exec.Command("sh", path)
+		// The last PATH wins: os/exec keeps only the last value of a duplicated key.
+		cmd.Env = append(os.Environ(), "PATH="+stubDir+":"+os.Getenv("PATH"))
+		cmd.Stdout, cmd.Stderr = log, log
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		Expect(cmd.Start()).To(Succeed())
+		DeferCleanup(func() {
+			// The whole group: the idling writer's `sleep` is a child of it.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			_ = log.Close()
+		})
+	}
+
+	DescribeTable("dies with the reason instead of appending to the journal anyway",
+		func(name string, stub func() string, want string) {
+			start(name, stub())
+
+			By("waiting for the writer to report the trim it could not do")
+			Eventually(func() string {
+				log, _ := os.ReadFile(logPath)
+				return string(log)
+			}).WithTimeout(wait).WithPolling(poll).Should(ContainSubstring("pod-io-workload: "+want),
+				"the writer must name the step that failed, not carry on silently")
+
+			By("expecting nothing appended to a journal whose last record is still partial")
+			Consistently(func(g Gomega) string {
+				content, err := os.ReadFile(journal)
+				g.Expect(err).NotTo(HaveOccurred())
+				return string(content)
+			}).WithTimeout(appendWatch).WithPolling(poll).Should(Equal(partialJournal),
+				"an append here puts the partial record in the MIDDLE of the journal, which is what the trim exists to prevent")
+
+			// The point of dying here: everything the dead container verified is still
+			// evidence. A record appended over the partial one would have cost all of it.
+			j, err := parseIOJournal(readFileString(journal))
+			Expect(err).NotTo(HaveOccurred(), "the journal the writer left behind must stay readable")
+			Expect(j.Beats).To(HaveLen(2))
+			Expect(j.Beats[len(j.Beats)-1].Sequence).To(Equal(int64(1)),
+				"the partial record must be neither dropped from nor completed into the history")
+			// No `fail` record, deliberately: it could only be appended to the partial
+			// record itself. The container's log carries the reason instead.
+			Expect(j.Termination).To(BeNil())
+
+			_, err = os.Stat(journal + ".trim")
+			Expect(err).To(MatchError(os.ErrNotExist),
+				"a half-written trim copy left on the volume is the space the next writer needs")
+		},
+		Entry("the partial record cannot be dropped", "sed",
+			func() string { return "#!/bin/sh\nexit 1\n" },
+			"journal: dropping the partial last record failed"),
+		Entry("the trimmed copy cannot replace the journal", "mv",
+			func() string {
+				GinkgoHelper()
+				mv, err := exec.LookPath("mv")
+				Expect(err).NotTo(HaveOccurred())
+				// Only the trim's own mv fails. The data file is renamed with the same
+				// mv, and a stub that failed everywhere would kill the writer in the
+				// data phase, long before it reaches the journal.
+				return strings.Join([]string{
+					"#!/bin/sh",
+					`if [ "$3" = "` + journal + `" ]; then exit 1; fi`,
+					`exec ` + mv + ` "$@"`,
+					"",
+				}, "\n")
+			},
+			"journal: replacing the journal with its trimmed copy failed"),
+	)
+})
+
 // shellSyntaxError runs `sh -n` over script and reports what it said.
 func shellSyntaxError(script string) error {
 	GinkgoHelper()

@@ -92,7 +92,12 @@ const (
 //     takes the only way to read its own evidence with it. A failure is
 //     journalled as a `fail` record and then the container idles, which is what
 //     lets the framework report the failure with its message instead of an
-//     unexplained absence of beats.
+//     unexplained absence of beats;
+//   - repair a journal that was cut mid-append before appending anything to it,
+//     and treat a repair that FAILED as fatal: appending to a journal whose last
+//     record is still partial is precisely what the repair exists to prevent.
+//     That single failure is reported through the container's log instead of the
+//     journal — see die_partial_journal.
 const podIOWorkloadProgram = `set -u
 
 journal=$dir/journal
@@ -135,6 +140,23 @@ die() {
     idle
 }
 
+# die_partial_journal reports the ONE failure the journal cannot carry: the trim
+# below could not drop a record the previous container was cut off in the middle
+# of. A 'fail' record appended there would be CONCATENATED onto that very partial
+# record — at best unreadable, at worst completing it into a line that parses as a
+# beat nobody ever verified. So the journal is left exactly as that container left
+# it: a partial LAST record is what the framework's parser tolerates, which keeps
+# every beat that container did publish readable through an exec into here. The
+# reason goes to the container's log, the one place a writer that cannot journal
+# can still be read. The half-written copy goes away with it: it is a prefix of a
+# journal that is being kept anyway, and on a volume that ran out of space it is
+# holding the only space left.
+die_partial_journal() {
+    rm -f "$journal.trim"
+    printf 'pod-io-workload: %s\n' "$1" >&2
+    idle
+}
+
 # A volume that cannot even be written to has no journal to explain itself: fail
 # the container instead, so the pod status carries the reason.
 mkdir -p "$dir" || { printf 'pod-io-workload: cannot create %s\n' "$dir" >&2; exit 1; }
@@ -163,8 +185,17 @@ fi
 # MIDDLE of the journal after the next append, and a malformed record anywhere but
 # the last line makes the whole journal unparsable — losing one beat is cheaper
 # than losing the entire history.
+#
+# A trim that FAILED therefore cannot be survived: this writer would append to the
+# journal regardless and produce exactly the state the trim exists to prevent —
+# unreadable history, or a partial record silently completed into a beat. Each step
+# names itself, because a trim that cannot be written and a trimmed copy that
+# cannot replace the journal are different faults of the volume.
 if [ -s "$journal" ] && [ -n "$(tail -c 1 "$journal")" ]; then
-    sed '$d' "$journal" >"$journal.trim" && mv -f "$journal.trim" "$journal"
+    sed '$d' "$journal" >"$journal.trim" ||
+        die_partial_journal "journal: dropping the partial last record failed"
+    mv -f "$journal.trim" "$journal" ||
+        die_partial_journal "journal: replacing the journal with its trimmed copy failed"
     sync_file "$journal" || die "journal: flushing the trimmed journal to the volume failed"
 fi
 
